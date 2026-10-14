@@ -19,6 +19,11 @@ import re
 import shutil
 from typing import Optional
 
+from memory.store import MemoryStore
+from memory.retriever import MemoryRetriever
+from memory.embedding import EmbeddingClient
+from memory.preference_manager import PreferenceManager
+
 from smolagents.agent_types import AgentAudio, AgentImage, AgentText, handle_agent_output_types
 from smolagents.agents import ActionStep, MultiStepAgent
 from smolagents.memory import MemoryStep
@@ -126,8 +131,9 @@ def pull_messages_from_step(
 def stream_to_gradio(
     agent,
     task: str,
-    reset_agent_memory: bool = False,
+    reset_agent_memory: bool = True,
     additional_args: Optional[dict] = None,
+    on_finish=None,
 ):
     """Runs an agent with the given task and streams the messages from the agent as gradio ChatMessages."""
     if not _is_package_available("gradio"):
@@ -142,20 +148,25 @@ def stream_to_gradio(
     for step_log in agent.run(task, stream=True, reset=reset_agent_memory, additional_args=additional_args):
         # Track tokens if model provides them
         if hasattr(agent.model, "last_input_token_count"):
-            total_input_tokens += agent.model.last_input_token_count
-            total_output_tokens += agent.model.last_output_token_count
+            input_tokens = getattr(agent.model, "last_input_token_count", None) or 0
+            output_tokens = getattr(agent.model, "last_output_token_count", None) or 0
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
             if isinstance(step_log, ActionStep):
-                step_log.input_token_count = agent.model.last_input_token_count
-                step_log.output_token_count = agent.model.last_output_token_count
+                step_log.input_token_count = input_tokens
+                step_log.output_token_count = output_tokens
 
         for message in pull_messages_from_step(
             step_log,
         ):
             yield message
 
-    final_answer = step_log  # Last log is the run's final_answer
-    final_answer = handle_agent_output_types(final_answer)
-
+    # final_answer = step_log  # Last log is the run's final_answer
+    # final_answer = handle_agent_output_types(final_answer)
+    final_answer = step_log.final_answer
+    if on_finish is not None:
+        on_finish(final_answer)
+        
     if isinstance(final_answer, AgentText):
         yield gr.ChatMessage(
             role="assistant",
@@ -188,16 +199,103 @@ class GradioUI:
         if self.file_upload_folder is not None:
             if not os.path.exists(file_upload_folder):
                 os.mkdir(file_upload_folder)
+        # add         
+        self.memory_store = MemoryStore()
 
+        try:
+            self.embedding_client = EmbeddingClient()
+        except Exception as exc:
+            print(f"Embedding 初始化失败，将使用非向量检索：{exc}")
+            self.embedding_client = None
+
+        self.memory_retriever = MemoryRetriever(
+            store=self.memory_store,
+            embedding_client=self.embedding_client,
+        )
+
+        self.preference_manager = PreferenceManager(
+            store=self.memory_store,
+            embedding_client=self.embedding_client,
+        )
+
+        self.user_id = "default_user"
+
+    # def interact_with_agent(self, prompt, messages):
+    #     import gradio as gr
+
+    #     messages.append(gr.ChatMessage(role="user", content=prompt))
+    #     yield messages
+    #     for msg in stream_to_gradio(self.agent, task=prompt, reset_agent_memory=False):
+    #         messages.append(msg)
+    #         yield messages
+    #     yield messages
+    
+    # modified
+    
+    
     def interact_with_agent(self, prompt, messages):
         import gradio as gr
 
         messages.append(gr.ChatMessage(role="user", content=prompt))
         yield messages
-        for msg in stream_to_gradio(self.agent, task=prompt, reset_agent_memory=False):
-            messages.append(msg)
-            yield messages
+
+        # 1. 检索用户偏好，必须在创建当前任务记录之前执行
+        preferences = self.memory_retriever.retrieve_preferences(
+            query=prompt,
+            user_id=self.user_id,
+            scope=None,
+            limit=5,
+        )
+        preference_context = self.memory_retriever.format_preferences(
+            preferences
+        )
+
+        # 2. 创建当前任务记录
+        run_id = self.memory_store.start_run(prompt)
+
+        # 3. 保存任务最终结果
+        def save_final_answer(answer):
+            if isinstance(answer, (AgentText, AgentImage, AgentAudio)):
+                answer = answer.to_string()
+            else:
+                answer = str(answer)
+
+            self.memory_store.finish_run(
+                run_id,
+                final_answer=answer,
+                status="success",
+            )
+
+        # 4. 将偏好作为上下文注入当前任务
+        agent_task = (
+            f"{preference_context}\n\n"
+            "请在不违背当前任务要求的前提下参考用户偏好。"
+            "偏好仅用于个性化，不应覆盖用户当前的明确指令。\n\n"
+            f"当前用户任务：\n{prompt}"
+        )
+        
+        try:
+            for msg in stream_to_gradio(
+                self.agent,
+                task=agent_task,
+                reset_agent_memory=True,
+                on_finish=save_final_answer,
+            ):
+                messages.append(msg)
+                yield messages
+
+        except Exception as exc:
+            self.memory_store.finish_run(
+                run_id,
+                final_answer="",
+                status="failed",
+                error=str(exc),
+            )
+            raise
+
         yield messages
+
+
 
     def upload_file(
         self,
