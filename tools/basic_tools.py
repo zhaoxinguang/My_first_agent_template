@@ -1,3 +1,5 @@
+"""基础工具：不依赖外部服务的本地能力。"""
+
 import datetime
 
 import pytz
@@ -19,3 +21,6 @@ def get_current_time_in_timezone(timezone: str) -> str:
         return f"The current local time in {timezone} is: {local_time}"
     except pytz.exceptions.UnknownTimeZoneError:
         return f"Unknown timezone: {timezone}"
+
+
+__all__ = ["get_current_time_in_timezone"]

@@ -55,6 +55,22 @@ class MemoryRetriever:
 
         return dot / (norm_a * norm_b)
 
+    def _structured_preferences(
+        self,
+        user_id: str,
+        scope: str | None,
+        limit: int,
+    ) -> list[dict]:
+        """不用向量的兜底：按更新时间取有效偏好。
+
+        相关性排序会丢失，但至少让记忆继续生效，
+        而不是因为向量服务抖动就整轮失忆。
+        """
+        return self.store.get_preferences(
+            user_id=user_id,
+            scope=scope,
+        )[:limit]
+
     def retrieve_preferences(
         self,
         query: str,
@@ -65,20 +81,31 @@ class MemoryRetriever:
         if not query or not query.strip() or limit < 1:
             return []
 
-        # 无 Embedding 服务时退化为读取结构化偏好。
+        # 没有 Embedding 客户端时退化为读取结构化偏好。
         if self.embedding_client is None:
-            return self.store.get_preferences(
+            return self._structured_preferences(
+                user_id, scope, limit
+            )
+
+        # 客户端创建成功不代表服务可用（构造过程不联网），
+        # 因此这里必须捕获运行期失败并回退，否则一次服务抖动
+        # 就会让偏好完全不被注入。
+        try:
+            query_vector = self.embedding_client.embed_query(
+                query.strip()
+            )
+            memories = self.store.get_embeddings(
                 user_id=user_id,
                 scope=scope,
-            )[:limit]
-
-        query_vector = self.embedding_client.embed_query(
-            query.strip()
-        )
-        memories = self.store.get_embeddings(
-            user_id=user_id,
-            scope=scope,
-        )
+            )
+        except Exception as exc:
+            print(
+                "[memory] 向量检索不可用，本次回退到结构化偏好："
+                f"{type(exc).__name__}: {exc}"
+            )
+            return self._structured_preferences(
+                user_id, scope, limit
+            )
 
         scored = []
         for item in memories:
@@ -91,6 +118,21 @@ class MemoryRetriever:
 
             item["similarity"] = similarity
             scored.append(item)
+
+        if not scored:
+            # 有偏好但没有当前模型的向量：换过 embedding 模型，
+            # 或写入时服务不可用导致向量缺失。降级而不是静默返回空。
+            fallback = self._structured_preferences(
+                user_id, scope, limit
+            )
+            if fallback:
+                print(
+                    "[memory] 未找到 "
+                    f"{self.embedding_client.model} 的向量，"
+                    "本次回退到结构化偏好；"
+                    "如需向量检索请执行 rebuild_embeddings()"
+                )
+            return fallback
 
         scored.sort(
             key=lambda item: (
@@ -123,7 +165,8 @@ class MemoryRetriever:
 
         return "\n".join(lines)
 
-    def format_context(self, memories: list[dict]) -> str:
+    @staticmethod
+    def format_context(memories: list[dict]) -> str:
         """格式化历史任务记录，保留原有接口。"""
         if not memories:
             return "没有检索到相关历史任务。"

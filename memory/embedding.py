@@ -70,6 +70,26 @@ class EmbeddingClient:
                 f"不支持的 embedding provider: {self.provider}"
             )
 
+    def health_check(self, timeout=3.0):
+        """探测 embedding 服务是否真的可用。
+
+        构造函数不发起任何网络请求，所以「客户端创建成功」并不等于
+        「服务可用」。启动时调用一次，才能把真实状态告诉使用者，
+        而不是等到检索时静默失败。
+
+        Returns:
+            (ok, detail)：不抛异常，失败时 detail 是原因字符串。
+        """
+        try:
+            client = self.client
+            with_options = getattr(client, "with_options", None)
+            if callable(with_options):
+                client = with_options(timeout=timeout)
+            client.models.list()
+            return True, "ok"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
     def embed_query(self, text):
         if not text or not text.strip():
             raise ValueError("待向量化文本不能为空")

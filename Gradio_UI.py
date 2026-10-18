@@ -20,14 +20,20 @@ import shutil
 from typing import Optional
 
 from memory.store import MemoryStore
-from memory.retriever import MemoryRetriever
-from memory.embedding import EmbeddingClient
-from memory.preference_manager import PreferenceManager
+from memory.context import DEFAULT_USER_ID
 
 from smolagents.agent_types import AgentAudio, AgentImage, AgentText, handle_agent_output_types
 from smolagents.agents import ActionStep, MultiStepAgent
 from smolagents.memory import MemoryStep
 from smolagents.utils import _is_package_available
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """读取布尔型环境变量：1/true/yes/on 视为真，其余视为假。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def pull_messages_from_step(
@@ -189,7 +195,13 @@ def stream_to_gradio(
 class GradioUI:
     """A one-line interface to launch your agent in Gradio"""
 
-    def __init__(self, agent: MultiStepAgent, file_upload_folder: str | None = None):
+    def __init__(
+        self,
+        agent,  # 底层 CodeAgent，或带记忆注入的 MemoryAgent
+        file_upload_folder: str | None = None,
+        memory_store: MemoryStore | None = None,
+        user_id: str = DEFAULT_USER_ID,
+    ):
         if not _is_package_available("gradio"):
             raise ModuleNotFoundError(
                 "Please install 'gradio' extra to use the GradioUI: `pip install 'smolagents[gradio]'`"
@@ -199,61 +211,22 @@ class GradioUI:
         if self.file_upload_folder is not None:
             if not os.path.exists(file_upload_folder):
                 os.mkdir(file_upload_folder)
-        # add         
-        self.memory_store = MemoryStore()
 
-        try:
-            self.embedding_client = EmbeddingClient()
-        except Exception as exc:
-            print(f"Embedding 初始化失败，将使用非向量检索：{exc}")
-            self.embedding_client = None
+        # UI 只负责记录 run，不做偏好检索与注入：
+        # 那两件事统一由 memory/context.py + MemoryAgent 负责。
+        self.memory_store = memory_store or MemoryStore()
+        self.user_id = user_id
 
-        self.memory_retriever = MemoryRetriever(
-            store=self.memory_store,
-            embedding_client=self.embedding_client,
-        )
-
-        self.preference_manager = PreferenceManager(
-            store=self.memory_store,
-            embedding_client=self.embedding_client,
-        )
-
-        self.user_id = "default_user"
-
-    # def interact_with_agent(self, prompt, messages):
-    #     import gradio as gr
-
-    #     messages.append(gr.ChatMessage(role="user", content=prompt))
-    #     yield messages
-    #     for msg in stream_to_gradio(self.agent, task=prompt, reset_agent_memory=False):
-    #         messages.append(msg)
-    #         yield messages
-    #     yield messages
-    
-    # modified
-    
-    
     def interact_with_agent(self, prompt, messages):
         import gradio as gr
 
         messages.append(gr.ChatMessage(role="user", content=prompt))
         yield messages
 
-        # 1. 检索用户偏好，必须在创建当前任务记录之前执行
-        preferences = self.memory_retriever.retrieve_preferences(
-            query=prompt,
-            user_id=self.user_id,
-            scope=None,
-            limit=5,
-        )
-        preference_context = self.memory_retriever.format_preferences(
-            preferences
-        )
-
-        # 2. 创建当前任务记录
+        # 1. 创建任务记录（记录用户原始输入，不是增强后的任务）
         run_id = self.memory_store.start_run(prompt)
 
-        # 3. 保存任务最终结果
+        # 2. 保存任务最终结果
         def save_final_answer(answer):
             if isinstance(answer, (AgentText, AgentImage, AgentAudio)):
                 answer = answer.to_string()
@@ -266,18 +239,11 @@ class GradioUI:
                 status="success",
             )
 
-        # 4. 将偏好作为上下文注入当前任务
-        agent_task = (
-            f"{preference_context}\n\n"
-            "请在不违背当前任务要求的前提下参考用户偏好。"
-            "偏好仅用于个性化，不应覆盖用户当前的明确指令。\n\n"
-            f"当前用户任务：\n{prompt}"
-        )
-        
+        # 3. 偏好注入由 MemoryAgent 统一完成，这里直接传原始 prompt
         try:
             for msg in stream_to_gradio(
                 self.agent,
-                task=agent_task,
+                task=prompt,
                 reset_agent_memory=True,
                 on_finish=save_final_answer,
             ):
@@ -356,8 +322,19 @@ class GradioUI:
             "",
         )
 
-    def launch(self, **kwargs):
+    def launch(self, share: bool | None = None, debug: bool | None = None, **kwargs):
+        """启动界面。
+
+        share/debug 默认从环境变量读取，缺省都是关闭：
+        默认 share=True 会把界面直接暴露到公网，不该是默认行为。
+        需要临时共享时用 ``GRADIO_SHARE=1 python app.py``。
+        """
         import gradio as gr
+
+        if share is None:
+            share = _env_flag("GRADIO_SHARE", False)
+        if debug is None:
+            debug = _env_flag("GRADIO_DEBUG", False)
 
         with gr.Blocks(fill_height=True) as demo:
             stored_messages = gr.State([])
@@ -388,7 +365,7 @@ class GradioUI:
                 [stored_messages, text_input],
             ).then(self.interact_with_agent, [stored_messages, chatbot], [chatbot])
 
-        demo.launch(debug=True, share=True, **kwargs)
+        demo.launch(debug=debug, share=share, **kwargs)
 
 
 __all__ = ["stream_to_gradio", "GradioUI"]
