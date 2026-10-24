@@ -25,7 +25,7 @@ def test_creates_db_file_and_tables(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-    assert {"agent_runs", "agent_steps", "user_memories", "memory_embeddings"} <= tables
+    assert {"agent_runs", "agent_steps", "user_memories", "memory_embeddings", "run_embeddings"} <= tables
 
 
 def test_init_is_idempotent(tmp_path):
@@ -288,3 +288,278 @@ def test_embedding_removed_with_preference_row(store):
         conn.execute("DELETE FROM user_memories WHERE memory_id = ?", (memory_id,))
 
     assert store.get_embeddings("u") == []
+
+
+# ---------- 历史对话向量（run_embeddings） ----------
+
+def _ok_run(store, task="查天气", answer="晴"):
+    run_id = store.start_run(task)
+    store.finish_run(run_id, final_answer=answer, status="success")
+    return run_id
+
+
+def test_save_run_embedding_upsert(store):
+    run_id = _ok_run(store)
+
+    store.save_run_embedding(run_id, [1.0, 2.0], "m1", "v1")
+    store.save_run_embedding(run_id, [3.0, 4.0], "m2", "v1")
+
+    rows = store.get_run_embeddings()
+    assert len(rows) == 1  # 同一 run 只保留一行
+    assert rows[0]["embedding"] == [3.0, 4.0]
+    assert rows[0]["embedding_model"] == "m2"
+
+
+def test_get_run_embeddings_joins_run_content(store):
+    run_id = _ok_run(store, task="计算123*456", answer="56088")
+    store.save_run_embedding(run_id, [1.0], "m1", "v1")
+
+    row = store.get_run_embeddings()[0]
+
+    assert row["run_id"] == run_id
+    assert row["task"] == "计算123*456"
+    assert row["final_answer"] == "56088"
+    assert row["status"] == "success"
+
+
+def test_run_embeddings_skip_failed_and_empty_answers(store):
+    ok = _ok_run(store)
+    failed = store.start_run("失败任务")
+    store.finish_run(failed, final_answer="", status="failed")
+    empty = _ok_run(store, task="空答案", answer="   ")
+
+    for run_id in (ok, failed, empty):
+        store.save_run_embedding(run_id, [1.0], "m1", "v1")
+
+    # 失败/空答案的 run 没有可复用事实，不参与召回
+    assert [r["run_id"] for r in store.get_run_embeddings()] == [ok]
+
+
+def test_get_run_embeddings_filters_by_model(store):
+    run_id = _ok_run(store)
+    store.save_run_embedding(run_id, [1.0], "old-model", "v1")
+
+    assert store.get_run_embeddings(model="old-model")
+    assert store.get_run_embeddings(model="new-model") == []
+
+
+def test_get_run_embeddings_limit_and_order(store):
+    first = _ok_run(store, task="任务一")
+    second = _ok_run(store, task="任务二")
+    for run_id in (first, second):
+        store.save_run_embedding(run_id, [1.0], "m1", "v1")
+
+    rows = store.get_run_embeddings(limit=1)
+
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == second  # 时间倒序，先拿最近的
+    assert store.get_run_embeddings(limit=0) == []
+
+
+def test_get_runs_missing_embedding(store):
+    indexed = _ok_run(store, task="已建向量")
+    pending = _ok_run(store, task="待建向量")
+    store.save_run_embedding(indexed, [1.0], "current", "v1")
+
+    missing = store.get_runs_missing_embedding(model="current")
+
+    assert [r["run_id"] for r in missing] == [pending]
+
+
+def test_get_runs_missing_embedding_treats_other_model_as_missing(store):
+    run_id = _ok_run(store)
+    store.save_run_embedding(run_id, [1.0], "old-model", "v1")
+
+    # 换模型后旧向量视为缺失 → 需要重建
+    assert [r["run_id"] for r in store.get_runs_missing_embedding(model="new-model")] == [run_id]
+    # model=None 表示「任意模型都算已建」
+    assert store.get_runs_missing_embedding(model=None) == []
+
+
+def test_run_embedding_removed_with_run(store):
+    run_id = _ok_run(store)
+    store.save_run_embedding(run_id, [1.0], "m1", "v1")
+
+    with store._connect() as conn:
+        conn.execute("DELETE FROM agent_runs WHERE run_id = ?", (run_id,))
+
+    assert store.get_run_embeddings() == []
+
+
+# ---------- 偏好：按需加载需要的查询 ----------
+
+def _pref(store, key="k", value="v", scope="global", user="u"):
+    return store.save_preference(user, "cat", key, value, scope=scope)
+
+
+def test_old_schema_gets_usage_columns(tmp_path):
+    """老库（没有 last_used_at / use_count）升级后必须能正常读写。"""
+    db_path = tmp_path / "old.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE user_memories (
+                memory_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                memory_key TEXT NOT NULL,
+                memory_value TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'global',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                source_run_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+
+    upgraded = MemoryStore(db_path=db_path)  # 触发迁移
+    upgraded.save_preference("u", "cat", "k", "v")
+
+    rows = upgraded.get_preferences("u")
+    assert rows[0]["use_count"] == 0
+    assert rows[0]["last_used_at"] is None
+
+
+def test_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "m.db"
+    MemoryStore(db_path=db_path)
+    MemoryStore(db_path=db_path)  # 二次初始化不应抛 duplicate column
+
+
+def test_count_active_preferences(store):
+    _pref(store, key="k1")
+    _pref(store, key="k2", scope="proj")
+
+    assert store.count_active_preferences("u") == 2
+    assert store.count_active_preferences("u", scope="proj") == 2  # 含 global
+    # 换一个作用域时 global 仍然算数（与向量检索口径一致），proj 那条不算
+    assert store.count_active_preferences("u", scope="other") == 1
+    assert store.count_active_preferences("nobody") == 0
+
+
+def test_count_active_preferences_skips_expired(store):
+    _pref(store, key="old")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE user_memories SET expires_at = ? WHERE memory_key = 'old'",
+            (PAST,),
+        )
+
+    assert store.count_active_preferences("u") == 0
+
+
+def test_touch_preferences_increments_usage(store):
+    memory_id = _pref(store)
+
+    store.touch_preferences([memory_id])
+    store.touch_preferences([memory_id])
+
+    row = store.get_preferences("u")[0]
+    assert row["use_count"] == 2
+    assert row["last_used_at"] is not None
+    # 用过的偏好不该被当成「刚被改写」，否则目录排序会把老记忆顶到最前
+    assert row["updated_at"] < row["last_used_at"]
+
+
+def test_touch_preferences_ignores_empty_input(store):
+    _pref(store)
+
+    assert store.touch_preferences([]) == 0
+    assert store.touch_preferences(None) == 0
+
+
+def test_overwrite_inherits_usage_count(store):
+    """覆盖同 key 时 use_count 记的是「这条偏好」，不随版本清零。
+
+    覆盖的实现是「旧行转 inactive + 插新行」，新行的 use_count 默认 0；
+    不继承的话，改一次值就等于把使用历史抹掉，目录排序随之把
+    刚更新的条目推到最末（甚至推出去）。
+    """
+    memory_id = _pref(store, key="style", value="简洁")
+    store.touch_preferences([memory_id])
+    store.touch_preferences([memory_id])
+
+    new_id = _pref(store, key="style", value="详细")
+
+    row = store.get_preferences("u")[0]
+    assert row["memory_id"] == new_id
+    assert row["use_count"] == 2
+    assert row["last_used_at"] is not None
+
+
+def test_first_write_has_zero_usage(store):
+    """首次写入（没有旧版本）不该凭空继承出计数。"""
+    _pref(store, key="fresh")
+
+    row = store.get_preferences("u")[0]
+    assert row["use_count"] == 0
+    assert row["last_used_at"] is None
+
+
+def test_deactivate_preference_by_key(store):
+    _pref(store, key="k", scope="proj")
+
+    assert store.deactivate_preference_by_key("u", "k", scope="proj") is True
+    assert store.deactivate_preference_by_key("u", "k", scope="proj") is False
+    assert store.count_active_preferences("u") == 0
+
+
+# ---------- 每轮对话的提炼记忆 ----------
+
+def test_save_and_get_turn_memory(store):
+    run_id = _ok_run(store)
+
+    store.save_turn_memory(
+        run_id, summary="本轮解决了快排实现", facts=["复杂度 O(n log n)"], model="m1"
+    )
+
+    memory = store.get_turn_memory(run_id)
+    assert memory["summary"] == "本轮解决了快排实现"
+    assert memory["facts"] == ["复杂度 O(n log n)"]
+    assert memory["model"] == "m1"
+    assert store.has_turn_memory(run_id) is True
+
+
+def test_turn_memory_upsert_keeps_single_row(store):
+    run_id = _ok_run(store)
+    store.save_turn_memory(run_id, summary="第一版")
+    store.save_turn_memory(run_id, summary="第二版")
+
+    assert store.get_turn_memory(run_id)["summary"] == "第二版"
+    with store._connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM turn_memories WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_turn_memory_absent_and_facts_default(store):
+    run_id = _ok_run(store)
+    assert store.get_turn_memory(run_id) is None
+    assert store.has_turn_memory(run_id) is False
+
+    store.save_turn_memory(run_id, summary="无事实")
+
+    assert store.get_turn_memory(run_id)["facts"] == []
+
+
+def test_turn_memory_removed_with_run(store):
+    run_id = _ok_run(store)
+    store.save_turn_memory(run_id, summary="摘要")
+
+    with store._connect() as conn:
+        conn.execute("DELETE FROM agent_runs WHERE run_id = ?", (run_id,))
+
+    assert store.get_turn_memory(run_id) is None
+
+
+def test_run_embeddings_expose_summary(store):
+    """历史召回要能拿到摘要（用来替代原始长答案）。"""
+    run_id = _ok_run(store)
+    store.save_run_embedding(run_id, [1.0], "m1", "v1")
+    store.save_turn_memory(run_id, summary="本轮摘要")
+
+    rows = store.get_run_embeddings(model="m1")
+
+    assert rows[0]["summary"] == "本轮摘要"

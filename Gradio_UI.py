@@ -17,10 +17,12 @@ import mimetypes
 import os
 import re
 import shutil
+import sys
 from typing import Optional
 
 from memory.store import MemoryStore
 from memory.context import DEFAULT_USER_ID
+from memory.history import HistoryIndex
 
 from smolagents.agent_types import AgentAudio, AgentImage, AgentText, handle_agent_output_types
 from smolagents.agents import ActionStep, MultiStepAgent
@@ -150,6 +152,7 @@ def stream_to_gradio(
 
     total_input_tokens = 0
     total_output_tokens = 0
+    step_seen = 0
 
     for step_log in agent.run(task, stream=True, reset=reset_agent_memory, additional_args=additional_args):
         # Track tokens if model provides them
@@ -161,6 +164,20 @@ def stream_to_gradio(
             if isinstance(step_log, ActionStep):
                 step_log.input_token_count = input_tokens
                 step_log.output_token_count = output_tokens
+
+            # 排障用：把每步的 token 数打到 stderr。
+            # 本地 ollama 的 num_ctx（默认 4096）限制的是「prompt + 生成」的
+            # 总窗口，不是 max_tokens。Input 一旦顶到窗口上限，模型会在半句
+            # 话处停笔（末尾常是个逗号），表现为 code parsing 失败，
+            # 而日志里没有任何异常。这一行让那种情况当场可查：
+            # 例如 `Input-tokens:3,986 | Output-tokens:110` ≈ 4,096 = 窗口满了。
+            print(
+                f"[model] step {step_seen} | Input-tokens:{input_tokens:,} "
+                f"| Output-tokens:{output_tokens:,}",
+                file=sys.stderr,
+                flush=True,
+            )
+            step_seen += 1
 
         for message in pull_messages_from_step(
             step_log,
@@ -201,6 +218,8 @@ class GradioUI:
         file_upload_folder: str | None = None,
         memory_store: MemoryStore | None = None,
         user_id: str = DEFAULT_USER_ID,
+        history_index: HistoryIndex | None = None,
+        distiller=None,
     ):
         if not _is_package_available("gradio"):
             raise ModuleNotFoundError(
@@ -216,6 +235,12 @@ class GradioUI:
         # 那两件事统一由 memory/context.py + MemoryAgent 负责。
         self.memory_store = memory_store or MemoryStore()
         self.user_id = user_id
+        # 历史对话的向量索引：给了就在每轮结束后补一条向量，
+        # 这样后续对话的语义召回才有数据可查（没给就只存文本，不建向量）。
+        self.history_index = history_index
+        # 每轮结束后的自动提炼（偏好 + 本轮摘要）。这是运行时保证，
+        # 不依赖模型自己想起来调 save_user_preference。
+        self.distiller = distiller
 
     def interact_with_agent(self, prompt, messages):
         import gradio as gr
@@ -238,6 +263,24 @@ class GradioUI:
                 final_answer=answer,
                 status="success",
             )
+
+            # 先落库文本，再建向量：embedding 服务抖动只会丢掉向量，
+            # 不会丢掉「用户问了什么、模型答了什么」这条记录。
+            if self.history_index is not None:
+                self.history_index.index_run(
+                    run_id=run_id,
+                    task=prompt,
+                    final_answer=answer,
+                )
+
+            # 自动提炼偏好 + 本轮摘要。放后台线程：答案已经给用户了，
+            # 提炼再慢也不该拖住这一轮；内部已兜住所有异常。
+            if self.distiller is not None:
+                self.distiller.distill_async(
+                    run_id=run_id,
+                    task=prompt,
+                    final_answer=answer,
+                )
 
         # 3. 偏好注入由 MemoryAgent 统一完成，这里直接传原始 prompt
         try:

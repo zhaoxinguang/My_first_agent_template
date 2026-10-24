@@ -2,12 +2,15 @@
 
 from memory.context import (
     DEFAULT_USER_ID,
+    HISTORY_INSTRUCTION,
     PREFERENCE_INSTRUCTION,
+    PREFERENCE_LOAD_HINT,
     augment_task,
     build_augmented_task,
     build_context,
+    build_history_context,
 )
-from memory.retriever import MemoryRetriever
+from memory.retriever import HISTORY_MAX_ITEMS, MemoryRetriever
 
 
 class _BrokenRetriever:
@@ -25,6 +28,30 @@ class _RecordingRetriever:
     def retrieve_preferences(self, **kwargs):
         self.kwargs = kwargs
         return self.memories
+
+    @staticmethod
+    def format_preferences(memories):
+        return "偏好块"
+
+
+class _HistoryRetriever:
+    """只实现历史召回 + 可选的偏好召回，用来验证两个块的拼装顺序。"""
+
+    def __init__(self, history=None, preferences=None):
+        self.history = history or []
+        self.preferences = preferences or []
+        self.history_kwargs = None
+
+    def retrieve_history(self, **kwargs):
+        self.history_kwargs = kwargs
+        return self.history
+
+    def retrieve_preferences(self, **kwargs):
+        return self.preferences
+
+    @staticmethod
+    def format_history(memories):
+        return "历史块"
 
     @staticmethod
     def format_preferences(memories):
@@ -95,3 +122,156 @@ def test_build_augmented_task_without_preferences_keeps_task_intact(store):
     retriever = MemoryRetriever(store=store, embedding_client=None)
 
     assert build_augmented_task("写个快排", retriever, user_id="u") == "写个快排"
+
+
+def test_catalog_reports_how_many_preferences_are_hidden(store):
+    """目录被条数上限截断时，必须告诉模型「还有 N 条」。
+
+    否则模型以为目录就是全部，用户也看不出记忆只生效了一部分。
+    """
+    for i in range(5):
+        store.save_preference("u", "cat", f"k{i}", f"值{i}")
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    result = build_augmented_task("写个快排", retriever, user_id="u", limit=2)
+
+    assert "只列了 2/5 条" in result
+    assert 'load_user_preferences("")' in result
+
+
+def test_catalog_without_truncation_has_no_count_note(store):
+    """没被截断时不该多出提示，避免每轮都塞一句无用的话。"""
+    store.save_preference("u", "cat", "only", "唯一一条")
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    result = build_augmented_task("写个快排", retriever, user_id="u")
+
+    assert "只列了" not in result
+
+
+def test_catalog_note_is_skipped_when_retriever_cannot_count():
+    """替身 retriever 没有计数能力时宁可不提示，也不猜一个数字。"""
+    retriever = _RecordingRetriever(memories=[{"memory_key": "k"}])
+
+    result = build_augmented_task("任务", retriever)
+
+    assert "只列了" not in result
+
+
+# ---------- 历史对话块 ----------
+
+def test_build_history_context_includes_instruction():
+    retriever = _HistoryRetriever(history=[{"task": "t", "final_answer": "a"}])
+
+    text = build_history_context("任务", retriever)
+
+    assert HISTORY_INSTRUCTION in text
+    assert "历史块" in text
+
+
+def test_build_history_context_empty_when_no_hit():
+    assert build_history_context("任务", _HistoryRetriever()) == ""
+
+
+def test_build_history_context_tolerates_retriever_without_history():
+    """只实现偏好检索的替身对象不该被历史召回拖挂。"""
+    retriever = _RecordingRetriever(memories=[{"memory_key": "k"}])
+
+    assert build_history_context("任务", retriever) == ""
+
+
+def test_history_limit_is_clamped_to_hard_cap():
+    """调用方要 10 条也只给 2 条：条数上限不允许被绕过。"""
+    retriever = _HistoryRetriever(history=[{"task": "t"}])
+
+    build_history_context("任务", retriever, limit=10)
+
+    assert retriever.history_kwargs["limit"] == HISTORY_MAX_ITEMS
+
+
+def test_history_can_be_disabled_with_zero():
+    retriever = _HistoryRetriever(history=[{"task": "t"}])
+
+    assert build_context("任务", retriever, history_limit=0) == ""
+    assert retriever.history_kwargs is None  # 0 条时压根不检索
+
+
+def test_build_context_puts_history_before_preferences():
+    retriever = _HistoryRetriever(
+        history=[{"task": "t"}], preferences=[{"memory_key": "k"}]
+    )
+
+    context = build_context("任务", retriever)
+
+    assert context.index("历史块") < context.index("偏好块")
+
+
+def test_build_context_with_only_history_skips_preference_instruction():
+    retriever = _HistoryRetriever(history=[{"task": "t"}])
+
+    result = build_augmented_task("写个快排", retriever)
+
+    assert HISTORY_INSTRUCTION in result
+    assert PREFERENCE_INSTRUCTION not in result
+    assert result.rstrip().endswith("写个快排")
+
+
+# ---------- 偏好：目录注入 + 按需加载 ----------
+
+
+def test_preference_block_is_catalog_not_full_text(store):
+    """长偏好只进目录要点，全文留给 load_user_preferences 按需取。"""
+    long_value = "用中文回答，先给结论再给步骤，代码必须可直接运行。" * 10
+    store.save_preference("u", "style", "answer_style", long_value)
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    result = build_augmented_task("写个快排", retriever, user_id="u")
+
+    assert "answer_style" in result
+    assert long_value not in result          # 全文没有进 prompt
+    assert "…" in result                     # 要点被截断
+    assert PREFERENCE_LOAD_HINT in result    # 但告诉了模型怎么按需取
+    assert "load_user_preferences" in result
+
+
+def test_short_preference_value_stays_visible(store):
+    """短偏好直接可读，不必为了它多跑一次工具。"""
+    store.save_preference("u", "style", "language", "中文")
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    result = build_augmented_task("写个快排", retriever, user_id="u")
+
+    assert "language" in result
+    assert "中文" in result
+
+
+def test_no_preferences_means_no_catalog_and_no_hint(store):
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    result = build_augmented_task("写个快排", retriever, user_id="u")
+
+    assert result == "写个快排"
+    assert "load_user_preferences" not in result
+
+
+def test_preference_catalog_stays_within_budget(store):
+    """偏好很多时目录也不能无限膨胀——每轮固定开销要有上限。"""
+    for i in range(30):
+        store.save_preference("u", "style", f"k{i}", "很长的偏好内容" * 5)
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    result = build_augmented_task("写个快排", retriever, user_id="u")
+    catalog = result.split(PREFERENCE_LOAD_HINT)[0]
+
+    assert len(catalog) <= 620 + 80  # 目录块预算（含换行）
+
+
+def test_catalog_reads_live_database_each_turn(store):
+    """动态更新：写完立刻生效，不需要重启或重建索引。"""
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    assert "新加的偏好" not in build_augmented_task("任务", retriever, user_id="u")
+
+    store.save_preference("u", "style", "fresh", "新加的偏好")
+
+    assert "新加的偏好" in build_augmented_task("任务", retriever, user_id="u")

@@ -15,6 +15,9 @@ def test_offline_toolset_exact():
         "get_current_time_in_timezone",
         "read_text_file",
         "list_files",
+        "load_user_preferences",
+        "save_user_preference",
+        "forget_user_preference",
         "final_answer",
     ]
 
@@ -88,3 +91,27 @@ def test_visit_webpage_reports_bad_url():
     tool = get_tool("visit_webpage", include_web=True)
 
     assert "Error" in tool("http://127.0.0.1:65535/nope")
+
+
+def test_web_search_failure_returns_error_string(monkeypatch):
+    """搜索后端限流/异常时必须返回字符串，不能抛异常。
+
+    抛异常会变成一步工具执行失败，模型容易原地重试到耗尽 max_steps，
+    最后既没答案也没 final_answer。
+
+    现在 web_search 走 DeepSeek Search API，直接在 requests.post 这一层注入异常。
+    """
+    pytest.importorskip("smolagents")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    tool = get_tool("web_search", include_web=True)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("backend down")
+
+    monkeypatch.setattr("tools.web_tools.requests.post", boom)
+
+    out = tool("anything")
+
+    assert out.startswith("Error: web search failed")
+    assert "visit_webpage" in out
+

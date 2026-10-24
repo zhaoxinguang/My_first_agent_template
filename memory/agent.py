@@ -1,20 +1,27 @@
 """带长期记忆的 Agent 包装器。
 
-它在每次执行前做一件事：把与本轮任务相关的记忆（当前是用户偏好）
-拼进任务描述，然后交给底层 CodeAgent 执行。
+它在每次执行前做一件事：把与本轮任务相关的记忆拼进任务描述，
+然后交给底层 CodeAgent 执行。注入两类记忆：
+
+- 历史对话：按语义相关性召回的「当时的问题 + 当时的回答」（有严格条数/字数上限）；
+- 用户偏好：长期偏好，语气是「参考」而不是「硬指令」。
 
 分层意图：
 - MemoryAgent 只负责「任务增强」，不关心 UI，也不负责写记忆；
-- 检索与格式化都在 memory/context.py 里，避免多处注入；
+- 检索与格式化都在 memory/ 层（retriever / context），避免多处注入；
 - 底层 agent 仍然是普通的 smolagents CodeAgent，可单独测试。
 """
 
 from memory.context import DEFAULT_USER_ID, build_augmented_task
-from memory.retriever import MemoryRetriever
+from memory.retriever import (
+    DEFAULT_HISTORY_LIMIT,
+    PREF_INDEX_MAX_ITEMS,
+    MemoryRetriever,
+)
 
 
 class MemoryAgent:
-    """给任意 smolagents agent 套一层偏好注入。"""
+    """给任意 smolagents agent 套一层记忆注入。"""
 
     def __init__(
         self,
@@ -22,13 +29,19 @@ class MemoryAgent:
         retriever: MemoryRetriever | None = None,
         user_id: str = DEFAULT_USER_ID,
         scope: str | None = None,
-        limit: int = 5,
+        # 目录条数默认放开到上限（8 条）：偏好预算可以到 40 条，
+        # 而目录是它们唯一的自动注入入口，默认只给 5 条等于让大半偏好
+        # 连「被看见」的机会都没有。字符预算由 PREF_INDEX_MAX_CHARS 单独把住。
+        limit: int = PREF_INDEX_MAX_ITEMS,
+        history_limit: int = DEFAULT_HISTORY_LIMIT,
     ):
         self.agent = agent
         self.retriever = retriever or MemoryRetriever()
         self.user_id = user_id
         self.scope = scope
         self.limit = limit
+        # 0 表示关闭历史注入；上限由 memory/retriever.py 的常量把住
+        self.history_limit = history_limit
 
     # ---------- 对外能力 ----------
 
@@ -40,6 +53,7 @@ class MemoryAgent:
             user_id=self.user_id,
             scope=self.scope,
             limit=self.limit,
+            history_limit=self.history_limit,
         )
 
     def run(self, task: str, *args, **kwargs):

@@ -2,7 +2,13 @@
 
 import pytest
 
-from memory.preference_manager import PreferenceManager
+from memory.preference_manager import (
+    PreferenceBudgetError,
+    PreferenceManager,
+    canonical_category,
+    canonicalize_preference,
+    known_values_for,
+)
 from memory.store import MemoryStore
 from tests.helpers import FakeEmbeddingClient
 
@@ -107,3 +113,179 @@ def test_manager_uses_single_store_instance(tmp_path):
     manager = PreferenceManager(store=store, embedding_client=None)
 
     assert manager.store is store
+
+
+# ---------- 动态更新：upsert / 预算 / 按 key 遗忘 ----------
+
+def _manager(store, client=None, **kwargs):
+    return PreferenceManager(
+        store=store, embedding_client=client, **kwargs
+    )
+
+
+def test_upsert_same_key_overwrites_instead_of_appending(store):
+    manager = _manager(store)
+
+    manager.upsert("u", "style", "回答简洁")
+    manager.upsert("u", "style", "回答详细")
+
+    active = manager.list_preferences("u")
+    assert len(active) == 1
+    assert active[0]["memory_value"] == "回答详细"
+    # 旧值保留为历史版本（is_active=0），不是被物理删除
+    assert store.count_active_preferences("u") == 1
+
+
+def test_upsert_rejects_blank_key_or_value(store):
+    manager = _manager(store)
+
+    for key, value in (("", "v"), ("k", ""), ("   ", "v"), ("k", "   ")):
+        with pytest.raises(ValueError):
+            manager.upsert("u", key, value)
+
+
+def test_upsert_enforces_char_budget_with_actionable_message(store):
+    """超预算必须报错（而不是静默截断），且错误信息要能指导下一步。"""
+    manager = _manager(store, char_limit=20)
+    manager.upsert("u", "k1", "0123456789")  # key+value = 12 字符
+
+    with pytest.raises(PreferenceBudgetError) as err:
+        manager.upsert("u", "k2", "0123456789")
+
+    message = str(err.value)
+    assert "20" in message          # 上限
+    assert "forget_user_preference" in message  # 怎么腾空间
+    assert "k1" in message          # 现有哪些条目可以删
+
+
+def test_upsert_budget_counts_overwrite_as_not_new(store):
+    """覆盖同一条不新增占用，否则写满之后连改错别字都会被拒。"""
+    manager = _manager(store, char_limit=30)
+    manager.upsert("u", "k1", "0123456789")
+    manager.upsert("u", "k1", "0123456789")
+    manager.upsert("u", "k1", "0123456789")
+
+    assert manager.budget_status("u")["items"] == 1
+
+
+def test_upsert_enforces_item_count_limit(store):
+    manager = _manager(store, max_items=2)
+    manager.upsert("u", "k1", "v1")
+    manager.upsert("u", "k2", "v2")
+
+    with pytest.raises(PreferenceBudgetError, match="条数"):
+        manager.upsert("u", "k3", "v3")
+
+
+def test_budget_status_reports_usage(store):
+    manager = _manager(store, char_limit=100, max_items=5)
+    manager.upsert("u", "ab", "cde")  # 5 字符
+
+    status = manager.budget_status("u")
+
+    assert status["items"] == 1
+    assert status["used_chars"] == 5
+    assert status["remaining_chars"] == 95
+    assert status["ok"] is True
+
+
+def test_forget_removes_by_key(store):
+    manager = _manager(store)
+    manager.upsert("u", "style", "回答简洁")
+
+    assert manager.forget("u", "style") is True
+    assert manager.list_preferences("u") == []
+    assert manager.forget("u", "style") is False
+
+
+def test_forget_falls_back_to_other_scopes(store):
+    """偏好记在 proj 作用域、按 global 删也要能删掉（避免静默失败）。"""
+    manager = _manager(store)
+    manager.upsert("u", "style", "回答简洁", scope="proj")
+
+    assert manager.forget("u", "style") is True
+    assert store.count_active_preferences("u") == 0
+
+
+def test_forget_ignores_blank_key(store):
+    assert _manager(store).forget("u", "  ") is False
+
+
+def test_write_path_still_works_without_embedding_client(store):
+    """向量服务没起时，动态写入只丢向量、不丢数据。"""
+    manager = _manager(store, client=None)
+
+    manager.upsert("u", "style", "回答简洁")
+
+    assert [p["memory_value"] for p in manager.list_preferences("u")] == ["回答简洁"]
+    assert store.get_embeddings("u") == []
+
+
+def test_upsert_writes_vector_when_client_available(store):
+    manager = _manager(store, client=FakeEmbeddingClient(model="m-up"))
+
+    manager.upsert("u", "style", "回答简洁")
+
+    rows = store.get_embeddings("u")
+    assert [row["embedding_model"] for row in rows] == ["m-up"]
+
+
+# ---------- 规范化：同义 key 收敛、低置信度不许顶掉高置信度 ----------
+
+def test_canonicalize_preference_collapses_detail_dimension():
+    """`detail_level` / `detail_degree` / `verbosity` 是同一件事。"""
+    for key in ("detail_level", "detail_degree", "verbosity", "response_length"):
+        assert canonicalize_preference(key, "回答简短一点")[0] == "answer_length"
+
+
+def test_canonicalize_preference_uses_value_when_key_is_wrong():
+    """值本身说明了维度时以值判维度：题目里那些错位记录都能纠回来。"""
+    assert canonicalize_preference("answer_format", "可爱风格")[0] == "response_style"
+    assert canonicalize_preference("response_style", "简短")[0] == "answer_length"
+    # 值也一起归一，目录里不会一会儿「short」一会儿「简短」
+    assert canonicalize_preference("verbosity", "short") == ("answer_length", "简短")
+
+
+def test_canonicalize_preference_leaves_compound_values_alone():
+    """复合值不硬塞维度：那会丢信息。"""
+    key, value = canonicalize_preference("style", "回答简洁，先给可运行代码")
+    assert key == "style"
+    assert value == "回答简洁，先给可运行代码"
+
+
+def test_canonical_category_keeps_explicit_tooling():
+    assert canonical_category("tooling", "python_cmd") == "tooling"
+    assert canonical_category("detail_degree", "answer_length") == "response_style"
+    assert canonical_category("preference", "language") == "response_style"
+    assert canonical_category("", "python_cmd") == "other"
+
+
+def test_known_values_for_lists_dimension_vocabulary():
+    assert "简短" in known_values_for("answer_length")
+    assert "informal" not in known_values_for("answer_format")
+    assert known_values_for("python_cmd") == set()
+
+
+def test_upsert_refuses_low_confidence_downgrade(store):
+    """回归：confidence=0.1 的猜测不许顶掉用户明确说过的偏好。
+
+    真实事故：自动提炼写了一条 language=english(0.1)，把
+    language=中文(0.8) 顶成失效，之后每轮 prompt 都写着 english。
+    """
+    manager = PreferenceManager(store=store, embedding_client=None)
+    kept_id = manager.upsert("u", "language", "中文", confidence=0.8)
+
+    new_id = manager.upsert("u", "language", "english", confidence=0.1)
+
+    assert new_id == kept_id
+    assert [p["memory_value"] for p in manager.list_preferences("u")] == ["中文"]
+
+
+def test_upsert_allows_newer_high_confidence_value(store):
+    """置信度不降时照常覆盖：闸门只挡「猜的」，不挡「用户改主意」。"""
+    manager = PreferenceManager(store=store, embedding_client=None)
+    manager.upsert("u", "language", "中文", confidence=0.8)
+
+    manager.upsert("u", "language", "英文", confidence=0.9)
+
+    assert [p["memory_value"] for p in manager.list_preferences("u")] == ["英文"]
