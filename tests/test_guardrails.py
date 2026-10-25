@@ -179,3 +179,83 @@ def test_run_resets_trimmer_counters_and_tool_cache():
     assert agent.run("查询广州今日的天气") == "answer"
     assert guards["trimmer"].folded_steps == 0   # 每轮清零
     assert tool.cache.get("q") is None           # 工具缓存也清空
+
+
+# ---------------------------------------------------------------------------
+# 工具名拼错：把「没有这个函数」改写成「你大概想用 X」
+#
+# 真实现场（查高铁班次）：llama3.2 把 load_user_preferences 写成单数，
+# 撞上 Forbidden function evaluation 后彻底放弃这个工具，改成
+# result.split("\n") 直接把原始搜索结果当答案交出去。
+# ---------------------------------------------------------------------------
+
+_NAME_ERROR = (
+    "Code execution failed at line 'x = load_user_preference(query=\"a\")' due to: "
+    "InterpreterError: Forbidden function evaluation: 'load_user_preference' is not "
+    "among the explicitly allowed tools or defined/imported in the preceding code"
+)
+
+
+def _name_error_messages(text=_NAME_ERROR):
+    return [{"role": "tool-response", "content": [{"type": "text", "text": text}]}]
+
+
+def test_repair_tool_name_points_at_the_closest_tool():
+    from agent.guardrails import repair_tool_name_errors
+
+    fixed = repair_tool_name_errors(_name_error_messages(), ["load_user_preferences", "web_search"])
+
+    text = fixed[0]["content"][0]["text"]
+    assert "load_user_preferences" in text
+    assert "没有名为 load_user_preference 的工具" in text
+    # 必须给下一步动作，否则小模型不知道该重跑还是该换做法
+    assert "重新执行这一步" in text
+    assert "不要改用字符串切分" in text
+
+
+def test_repair_tool_name_keeps_original_code_for_audit():
+    from agent.guardrails import repair_tool_name_errors
+
+    fixed = repair_tool_name_errors(_name_error_messages(), ["load_user_preferences"])
+
+    # 模型自己的那行代码要留着，它得知道自己写错了什么
+    assert "load_user_preference(query=" in fixed[0]["content"][0]["text"]
+    # 原来的英文模板不该再出现在模型眼前
+    assert "is not among the explicitly allowed tools" not in fixed[0]["content"][0]["text"]
+
+
+def test_repair_tool_name_lists_available_tools_when_nothing_is_close():
+    from agent.guardrails import repair_tool_name_errors
+
+    text = (
+        "InterpreterError: Forbidden function evaluation: 'zzzqqq' is not among "
+        "the explicitly allowed tools"
+    )
+    fixed = repair_tool_name_errors(_name_error_messages(text), ["web_search", "extract"])
+
+    out = fixed[0]["content"][0]["text"]
+    assert "可用工具：extract, web_search" in out
+
+
+def test_repair_tool_name_leaves_other_observations_alone():
+    from agent.guardrails import repair_tool_name_errors
+
+    messages = [
+        {"role": "assistant", "content": [{"type": "text", "text": _NAME_ERROR}]},
+        {"role": "tool-response", "content": [{"type": "text", "text": "正常的工具结果"}]},
+    ]
+    fixed = repair_tool_name_errors(messages, ["load_user_preferences"])
+
+    # assistant 自己写的话不动（那是模型的输出，不是回执）
+    assert fixed[0]["content"][0]["text"] == _NAME_ERROR
+    assert fixed[1]["content"][0]["text"] == "正常的工具结果"
+
+
+def test_repair_tool_name_does_not_mutate_memory_steps():
+    from agent.guardrails import repair_tool_name_errors
+
+    original = _name_error_messages()
+    snapshot = original[0]["content"][0]["text"]
+    repair_tool_name_errors(original, ["load_user_preferences"])
+
+    assert original[0]["content"][0]["text"] == snapshot

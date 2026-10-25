@@ -69,11 +69,13 @@ def test_save_same_key_updates_in_place(toolset, store):
 
 
 def test_load_by_key_name_does_not_need_semantic_search(toolset):
+    """点名一个同义 key 也能命中（写侧会把同义 key 收敛到规范维度）。"""
     toolset["save_user_preference"]("preferred_detail_level", "简洁")
 
     loaded = toolset["load_user_preferences"]("detail")
 
-    assert "preferred_detail_level" in loaded
+    assert "answer_length" in loaded  # 规范 key，而不是写进去的那个别名
+    assert "简短" in loaded  # 值也归一了（简洁 → 简短）
 
 
 def test_load_unknown_query_degrades_to_all_without_embedding(toolset):
@@ -99,6 +101,32 @@ def test_load_without_any_preference(toolset):
 def test_save_rejects_blank_inputs(toolset):
     assert toolset["save_user_preference"]("", "v").startswith("Error:")
     assert toolset["save_user_preference"]("k", "  ").startswith("Error:")
+
+
+def test_save_reports_skipped_write_as_error(toolset, store, monkeypatch):
+    """``upsert`` 没写进库时必须如实报错，而不是「已保存」。
+
+    早期版本这种情况返回的是**旧条目的 memory_id**，工具层看到非空 id
+    就回「已保存」，模型以为写成功了，下一轮在目录里找不到又写一遍。
+    """
+    save = toolset["save_user_preference"]
+
+    def _skip(*args, **kwargs):
+        raise memory_tools.PreferenceSkipped(
+            "现有条目置信度更高（0.90 > 0.10），保留原偏好。"
+        )
+
+    # _manager() 每次都新建一个实例，要打在类上才拦得住
+    monkeypatch.setattr(
+        memory_tools.PreferenceManager, "upsert", lambda self, **kw: _skip()
+    )
+
+    out = save("language", "english")
+
+    assert out.startswith("Error:")
+    assert "未写入" in out
+    assert "置信度" in out
+    assert store.count_active_preferences("default_user") == 0
 
 
 def test_save_reports_budget_error_as_string(store):

@@ -541,10 +541,14 @@ def test_preference_index_scope_includes_global(store):
 # ---------- 偏好目录：同维度归并 + 低置信度过滤 ----------
 
 def test_preference_index_merges_same_dimension(store):
-    """回归：同一件事存了三个 key，目录里必须只出现一条。
+    """回归：同一维度的多个别名 key，目录里只出现一条。
 
-    真实数据里 ``detail_level：简短`` / ``detail_degree：short`` /
-    ``response_style：简短`` 三条并存，目录列 5 行、模型能用的只有 1~2 条。
+    真实数据里 ``detail_level`` / ``detail_degree`` / ``verbosity`` 三条并存，
+    目录列 5 行、模型能用的只有 1~2 条。
+
+    归并**只按 key 别名**做，不看值猜维度：``response_style：简短`` 这种把
+    key 写错的记录会原样保留成单独一行（早期版本会按值改写成
+    ``answer_length``，等于替模型猜语义，猜错就悄悄改了用户想设的东西）。
     """
     store.save_preference("u", "response_style", "detail_level", "简短", confidence=0.7)
     store.save_preference("u", "detail_degree", "detail_degree", "short", confidence=0.8)
@@ -553,10 +557,12 @@ def test_preference_index_merges_same_dimension(store):
 
     rows = retriever.retrieve_preference_index(user_id="u")
 
-    assert [row["memory_key"] for row in rows] == ["answer_length"]
-    # 同维度取值最高（并列取最近写入）的那条胜出
-    assert rows[0]["memory_value"] == "简短"
-    assert retriever.count_preferences("u") == 1
+    keys = [row["memory_key"] for row in rows]
+    assert sorted(keys) == ["answer_length", "response_style"]
+    # 两个别名 key 归并成一条，取值归一过（short → 简短）
+    answer_length = [r for r in rows if r["memory_key"] == "answer_length"][0]
+    assert answer_length["memory_value"] == "简短"
+    assert retriever.count_preferences("u") == 2
 
 
 def test_preference_index_drops_low_confidence_noise(store):
@@ -587,6 +593,17 @@ def test_preference_index_trims_redundant_category(store):
     assert "- [tooling] python_cmd：用 uv 跑" in text  # 真分类保留
     assert "[detail_degree]" not in text
     assert "[response_style]" not in text
+
+
+def test_preference_index_keeps_values_from_the_dimension_vocabulary(store):
+    """白名单里的英文取值是合法偏好（用户真说了 English），不能被当成噪声。"""
+    store.save_preference("u", "response_style", "language", "english", confidence=0.8)
+    store.save_preference("u", "response_style", "answer_format", "markdown", confidence=0.8)
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    keys = [row["memory_key"] for row in retriever.retrieve_preference_index(user_id="u")]
+
+    assert sorted(keys) == ["answer_format", "language"]
 
 
 def test_load_preferences_by_canonical_key_matches_alias(store):

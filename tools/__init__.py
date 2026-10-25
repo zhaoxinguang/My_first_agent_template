@@ -33,12 +33,27 @@ from tools.memory_tools import (
     LoadPreferencesTool,
     SavePreferenceTool,
 )
-from tools.web_tools import (
-    ExtractTool,
-    TaskScopedCache,
-    VisitWebpageTool,
-    WebSearchTool,
-)
+
+# 联网工具是可选的：它依赖 requests / markdownify。
+# 这里必须容错——否则「没装这两个包」会让 ``import tools`` 整个失败，
+# 连带把本地工具和偏好工具一起带走（include_web=False 也就成了空话）。
+try:
+    from tools.web_tools import (
+        ExtractTool,
+        TaskScopedCache,
+        VisitWebpageTool,
+        WebSearchTool,
+    )
+except ImportError as exc:  # pragma: no cover - 取决于运行环境是否装依赖
+    _WEB_IMPORT_ERROR = exc
+    ExtractTool = None
+    TaskScopedCache = None
+    VisitWebpageTool = None
+    WebSearchTool = None
+else:
+    _WEB_IMPORT_ERROR = None
+
+_WEB_NAMES = ("VisitWebpageTool", "WebSearchTool", "ExtractTool", "TaskScopedCache")
 
 __all__ = [
     "build_tools",
@@ -51,12 +66,13 @@ __all__ = [
     "LoadPreferencesTool",
     "SavePreferenceTool",
     "ForgetPreferenceTool",
-    "VisitWebpageTool",
-    "WebSearchTool",
-    "ExtractTool",
-    "TaskScopedCache",
     "FinalAnswerTool",
 ]
+
+# 联网工具没装上依赖时不导出：把 None 挂进 __all__ 只会让
+# ``from tools import WebSearchTool`` 拿到一个 None，比 ImportError 更难查。
+if _WEB_IMPORT_ERROR is None:
+    __all__ += list(_WEB_NAMES)
 
 
 # 用途 + 调用方式说明。写给「读代码的人」，也是给 agent 的行为预期。
@@ -84,7 +100,7 @@ TOOL_GUIDE = {
     "web_search": {
         "purpose": (
             "DeepSeek 官方搜索接口（/v1/tools/search），返回标题、链接、摘要和评分，"
-            "用于找入口 URL。只回前几条（默认 5 条、总计 ≤1800 字符）；"
+            "用于找入口 URL。只回前几条（默认 3 条、总计 ≤1800 字符）；"
             "同一个 query 本轮搜第二次会直接回缓存，不要重复搜。"
             "失败时返回 Error 字符串（不抛异常），此时改 query 或换 extract。"
         ),
@@ -118,7 +134,8 @@ TOOL_GUIDE = {
     "save_user_preference": {
         "purpose": (
             "新增或覆盖一条用户长期偏好（同 key 再次写入即覆盖）。"
-            "只记稳定偏好；预算已满时返回 Error，需要先删再写。"
+            "没有自动提炼环节：是否写入由模型在任务收尾时自行判断，"
+            "只记下一轮仍然成立的偏好；预算已满时返回 Error，需要先删再写。"
         ),
         "usage": 'save_user_preference(key, value, category="general")',
         "example": 'save_user_preference("response_style", "回答简洁，先给可运行代码")',
@@ -140,8 +157,9 @@ def build_tools(
     """构造 agent 使用的工具列表。
 
     Args:
-        include_web: 是否包含联网工具。离线调试或没装
-            duckduckgo_search 时传 False。
+        include_web: 是否包含联网工具。离线调试、或运行环境缺
+            requests / markdownify 时传 False（缺依赖时这一组会自动缺席，
+            本地工具照常返回）。
         store: 记忆库。传 None 时偏好工具会在**第一次被调用**时
             才建默认库（构造工具本身不碰 SQLite，测试/离线无副作用）。
         embedding_client: 偏好向量化客户端；None 时读侧退化为结构化读取，
@@ -165,7 +183,13 @@ def build_tools(
         ForgetPreferenceTool(**memory_kwargs),
     ]
 
-    if include_web:
+    if include_web and WebSearchTool is None:
+        # 依赖没装全：联网工具整组缺席，但仍然给本地工具，别让启动直接失败。
+        print(
+            f"[tools] 未加载联网工具（{_WEB_IMPORT_ERROR}）："
+            "本次只有本地工具与偏好工具；需要联网请安装 requests 与 markdownify"
+        )
+    elif include_web:
         # 三个联网工具共享一份「本轮缓存」：重复的 query/url 不再打网络，
         # 抓过的页面也能被 extract 直接复用。每轮由 agent/guardrails.py 清空。
         web_cache = TaskScopedCache()
@@ -217,12 +241,19 @@ def get_tool(
     include_web: bool = True,
     store=None,
     embedding_client=None,
+    user_id=None,
 ):
-    """按名字取单个工具，找不到返回 None。"""
+    """按名字取单个工具，找不到返回 None。
+
+    ``user_id`` 与 :func:`build_tools` 同名同义：不给就用项目默认用户。
+    少了它就没法为「非默认用户」单独取一个偏好工具，测试与多用户调用
+    只能绕道 ``build_tools(...)[i]``。
+    """
     for item in build_tools(
         include_web=include_web,
         store=store,
         embedding_client=embedding_client,
+        user_id=user_id,
     ):
         if getattr(item, "name", None) == name:
             return item

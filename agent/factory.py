@@ -5,6 +5,10 @@ from typing import Any, cast
 
 from smolagents import CodeAgent
 
+from agent.final_answer_tool import (
+    FinalAnswerRewritingExecutor,
+    LenientFinalAnswerTool,
+)
 from agent.guardrails import attach_guards
 from agent.model import create_model
 from config.settings import MAX_STEPS, PROMPT_PATH, VERBOSITY_LEVEL
@@ -61,6 +65,14 @@ def create_agent(
         description=None,
         prompt_templates=cast(Any, prompt_templates),
     )
+    # final_answer 换成宽容版：模型把偏好当成它的参数时（
+    # final_answer(x, answer_format="分条")）不再抛 TypeError 白跑一步。
+    # 必须在 run 之前换——send_tools 只在 run() 开头同步一次。
+    agent.tools["final_answer"] = LenientFinalAnswerTool()
+    # 光换工具不够：evaluate_python_code 执行前会把 final_answer 换成
+    # 只收一个位置参数的闭包，所以还要在代码进 executor 之前删掉多余参数。
+    agent.python_executor = FinalAnswerRewritingExecutor(agent.python_executor)
+
     # 护栏必须在工具装配之后：它要给联网工具挂「调用记账」，
     # 用来判断模型报的时效性数据到底是不是本轮查来的；
     # 同时挂上旧 Observation 折叠（上下文预算）和每轮工具缓存重置。

@@ -270,28 +270,6 @@ def test_llama_profile_exists_in_settings(monkeypatch):
         importlib.reload(settings)
 
 
-# ---------- 后台提炼固定不思考 ----------
-
-
-def test_distiller_always_disables_thinking(monkeypatch, tmp_path):
-    """提炼只要 JSON：不该跟随 AGENT_REASONING_EFFORT 一起变慢。"""
-    from memory.distiller import TurnDistiller
-    from memory.store import MemoryStore
-
-    calls = []
-
-    def fake_create_model(reasoning_effort=None):
-        calls.append(reasoning_effort)
-        return object()
-
-    monkeypatch.setattr("agent.model.create_model", fake_create_model, raising=True)
-
-    distiller = TurnDistiller(store=MemoryStore(db_path=tmp_path / "m.db"))
-    distiller._get_model()
-
-    assert calls == ["none"]
-
-
 # ---------- settings 层的取值校验 ----------
 
 

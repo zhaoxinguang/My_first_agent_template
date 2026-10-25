@@ -19,7 +19,11 @@
 from smolagents.tools import Tool
 
 from memory.context import DEFAULT_USER_ID
-from memory.preference_manager import PreferenceBudgetError, PreferenceManager
+from memory.preference_manager import (
+    PreferenceBudgetError,
+    PreferenceManager,
+    PreferenceSkipped,
+)
 from memory.retriever import PREF_LOAD_MAX_ITEMS, MemoryRetriever
 
 # 懒加载的默认 store：只有真的调用工具时才建库/连库
@@ -137,10 +141,11 @@ class LoadPreferencesTool(_PreferenceTool):
 class SavePreferenceTool(_PreferenceTool):
     name = "save_user_preference"
     description = (
-        "新增或覆盖一条用户长期偏好。当用户明确表达了可长期复用的偏好"
-        "（语言、回答格式、称呼、禁忌、常用环境）时调用。"
-        "同一个 key 再次写入视为覆盖旧值。"
-        "只记稳定偏好，不要把任务进度或临时数据写进来。"
+        "新增或覆盖一条用户长期偏好。系统不会自动提炼偏好，"
+        "是否写入由你自己在任务收尾时判断：本轮暴露了下一轮仍然成立的信息"
+        "（语言、回答长度、输出格式、语气、工具环境、禁忌）才调用，"
+        "没有就完全不要调用。同一个 key 再次写入视为覆盖旧值。"
+        "不要把任务进度、临时数据或一次性要求写进来。"
     )
     inputs = {
         "key": {
@@ -170,12 +175,15 @@ class SavePreferenceTool(_PreferenceTool):
 
         manager = self._manager()
         try:
-            manager.upsert(
+            memory_id = manager.upsert(
                 user_id=self.user_id,
                 memory_key=key,
                 memory_value=value,
                 category=str(category or "general").strip() or "general",
             )
+        except PreferenceSkipped as exc:
+            # 「没写进去」但不算错误：如实回执，别让模型以为写成功了
+            return f"Error: 未写入 {key}={value}。{exc}"
         except PreferenceBudgetError as exc:
             # 预算不足是可预期的「让模型自己腾地方」，不是异常路径
             return f"Error: {exc}"

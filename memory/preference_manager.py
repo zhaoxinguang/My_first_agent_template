@@ -14,6 +14,7 @@
 
 import json
 import os
+import re
 
 from memory.store import MemoryStore
 
@@ -24,18 +25,20 @@ PREF_TOTAL_CHAR_LIMIT = 3500
 # 条数上限：防止「每条形如 20 字」的碎片把预算切得太碎。
 PREF_MAX_ITEMS = 40
 # 新值的置信度比旧值低这么多时视为「猜测」，不覆盖旧值。
-# 真实事故：自动提炼把 confidence=0.1 的 language=english 写上去，
+# 真实事故：写侧曾把 confidence=0.1 的 language=english 写上去，
 # 顶掉了用户明确说过的 confidence=0.8 的 language=中文，
 # 之后每轮 prompt 里都写着 english，模型却按中文答，看起来「偏好完全没生效」。
+# 现在写侧只剩模型主动调 save_user_preference（confidence 默认 1.0），
+# 这道闸仍然保留：手工 API 与将来的写入口都可能带低置信度。
 PREF_CONFIDENCE_DROP_LIMIT = 0.2
 
 
 # ---------------------------------------------------------------------------
 # (key, value) 规范化：同一件事只允许一个 key
 # ---------------------------------------------------------------------------
-# 自动提炼让模型自由起 key，结果同一件事攒出
+# 让模型自由起 key，同一件事就会攒出
 # ``response_style`` / ``detail_level`` / ``detail_degree`` 三条，
-# 目录里看着 5 条、模型能用的其实只有一两条。
+# 目录里看着 5 条、模型能用的其实只有一两条（历史数据就是这么攒出来的）。
 # 这里给「有明确枚举范围」的维度定死规范 key，其余 key 原样保留
 # （工具路径由用户/模型显式写入，指纹即语义，不该被悄悄改名）。
 CANONICAL_KEY_ALIASES = {
@@ -64,28 +67,6 @@ CANONICAL_KEY_ALIASES = {
     "回答格式": "answer_format",
 }
 
-# 「值本身就能说明属于哪一维」的单词式取值。
-# 只认单词（``简短`` / ``short``），复合值（``回答简洁，先给可运行代码``）
-# 保持原 key：把一个复合偏好硬塞进某个维度只会丢信息。
-_VALUE_DIMENSIONS = {
-    "answer_length": {
-        "简短", "简洁", "简略", "精炼", "短", "详细", "详尽", "长",
-        "short", "brief", "concise", "detailed", "long", "verbose",
-    },
-    "answer_format": {
-        "text", "纯文本", "markdown", "md", "json", "table", "表格",
-        "bullet", "列表", "分条", "plain",
-    },
-    "language": {
-        "中文", "汉语", "英文", "英语", "日文", "日语",
-        "chinese", "english", "japanese", "中英混排",
-    },
-    "response_style": {
-        "可爱", "可爱风格", "幽默", "风趣", "严肃", "正式", "亲切", "温柔",
-        "cute", "funny", "formal", "friendly", "professional",
-    },
-}
-
 # 值归一：同一个意思只留一种写法，目录里才不会一会儿「简短」一会儿「short」
 _VALUE_CANONICAL = {
     "short": "简短", "brief": "简短", "concise": "简短", "简洁": "简短",
@@ -93,73 +74,51 @@ _VALUE_CANONICAL = {
     "detailed": "详细", "long": "详细", "verbose": "详细", "详尽": "详细",
     "长": "详细",
     "md": "markdown", "plain": "纯文本", "列表": "分条", "bullet": "分条",
-    # 模型把「分条陈述」写成 list / bullets 很常见；这条映射能保住用户
-    # 真实表达的偏好，而不是让 _looks_translated 把它当噪声丢掉
+    # 模型把「分条陈述」写成 list / bullets 很常见，归一到统一写法，
+    # 目录里才不会同一个意思占两行
     "list": "分条", "bullets": "分条", "bullet points": "分条",
     "汉语": "中文", "英文": "英文", "英语": "英文",
     "chinese": "中文", "english": "英文", "japanese": "日文",
 }
 
 
-def known_values_for(memory_key):
-    """某一维度的所有已知取值（小写）；未知维度返回空集合。
-
-    给提炼器当「防幻觉」白名单用：``answer_format：informal`` 这种既不在
-    枚举里、又是纯英文单词的值，基本可以断定是模型把中文偏好翻译成了英文
-    （真实数据里出现过 informal / low / english 三条）。
-    """
-    key = str(memory_key or "").strip().lower()
-    values = _VALUE_DIMENSIONS.get(key)
-    if not values:
-        return set()
-    return {value.lower() for value in values}
-
-
-def _value_dimension(memory_value):
-    """值若是单词式的维度取值，返回它属于哪一维；否则返回 None。"""
-    if not isinstance(memory_value, str):
-        return None
-    needle = memory_value.strip().lower()
-    if not needle:
-        return None
-    for dimension, values in _VALUE_DIMENSIONS.items():
-        if needle in {value.lower() for value in values}:
-            return dimension
-    return None
-
-
 def canonicalize_preference(memory_key, memory_value):
-    """把 ``(key, value)`` 收敛到固定维度，返回新的 ``(key, value)``。
+    """把 ``(key, value)`` 收敛到固定的五个维度之一，返回新的 ``(key, value)``。
 
-    两条规则：
+    只做两件事，都是纯字符串映射，不猜语义：
 
     1. **key 同义写法 → 规范 key**：``detail_level`` / ``detail_degree`` /
-       ``verbosity`` 都是 ``answer_length``；
-    2. **值是单词式的维度取值时以值判维度**：真实数据里
-       ``response_style：简短``（其实说的是长度）、
-       ``answer_format：可爱风格``（其实说的是语气）这类错位都能纠回来。
+       ``verbosity`` 都归到 ``answer_length``。不做这一步，同一件事会存成
+       三行、目录里各占一个名额，谁也覆盖不了谁；
+    2. **值写法归一**：``short`` → ``简短``、``md`` → ``markdown``、
+       ``列表`` → ``分条``。不做这一步，目录里会同时出现「简短」和「short」，
+       用户以为有两条偏好。
 
-    非单词值、非字符串值一律原样返回，绝不猜测。
+    值本身**不**参与判断 key（早期版本会看「值是不是某个维度的词」来反过来
+    改 key，等于替模型猜语义，猜错方向就悄悄改写了用户的偏好），
+    非字符串值一律原样返回。
     """
     key = str(memory_key or "").strip()
     if not key:
         return key, memory_value
 
-    key_dimension = CANONICAL_KEY_ALIASES.get(key.lower())
-    value_dimension = _value_dimension(memory_value)
-
-    if value_dimension and value_dimension != key_dimension:
-        canonical_key = value_dimension
-    elif key_dimension:
-        canonical_key = key_dimension
-    else:
-        canonical_key = key
+    canonical_key = CANONICAL_KEY_ALIASES.get(key.lower(), key)
 
     if isinstance(memory_value, str):
         stripped = memory_value.strip()
         memory_value = _VALUE_CANONICAL.get(stripped.lower(), stripped)
 
     return canonical_key, memory_value
+
+
+def normalize_preference(memory_key, memory_value, category=None):
+    """把模型给的 ``(key, value, category)`` 收敛成规范写法；**不碰数据库**。
+
+    单独拆出来是为了把「判断」和「落库」分开：``upsert`` 只负责校验预算和
+    写入，调用方（工具层、排障脚本）也能单独预演归一化结果。
+    """
+    key, value = canonicalize_preference(memory_key, memory_value)
+    return key, value, canonical_category(category or "general", key)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +188,16 @@ class PreferenceBudgetError(ValueError):
 
     消息里必须带上「现在占了多少 / 上限多少 / 该怎么腾空间」，
     因为这条消息会被工具层原样回给模型，是它决定下一步的唯一依据。
+    """
+
+
+class PreferenceSkipped(ValueError):
+    """这条偏好**没有落库**，但不算错误（例如现有条目置信度更高）。
+
+    单独一个异常类型，是为了让工具层能把「没写进去」如实回给模型：
+    早期版本这种情况下 ``upsert`` 返回的是**旧条目的 memory_id**，
+    工具层看到非空 id 就回「已保存」，模型以为写成功了，
+    下一轮在目录里找不到又写一遍。
     """
 
 
@@ -367,6 +336,18 @@ class PreferenceManager:
         带预算校验和更友好的错误信息（会被工具层原样回给模型）。
         同一 (user, scope, key) 已存在时语义是**覆盖**：
         旧值自动失活保留为历史版本，不需要先删后写。
+
+        这里**只做三件事**：归一化（交给 :func:`normalize_preference`）、
+        置信度保护、预算校验，然后落库。归一化本身是纯函数，不依赖数据库，
+        所以「写成什么样」和「能不能写」可以分开测、分开读。
+
+        返回：写入（或覆盖）成功返回 memory_id。
+
+        异常：
+        - :class:`PreferenceBudgetError`：超预算，消息里带腾空间的办法；
+        - :class:`PreferenceSkipped`：**没有落库**（现有条目置信度更高）。
+          早期版本这里返回旧条目的 id，工具层据此回「已保存」，
+          模型以为写成功、下一轮找不到又写一遍——所以改成显式异常。
         """
         if not str(user_id or "").strip():
             raise ValueError("user_id 不能为空")
@@ -375,10 +356,13 @@ class PreferenceManager:
         if not str(memory_value or "").strip():
             raise ValueError("memory_value 不能为空")
 
-        memory_key = str(memory_key).strip()
+        # 先归一，再拿归一后的 key 去查重/查预算：否则同义 key 会各占一行。
+        memory_key, memory_value, category = normalize_preference(
+            memory_key, memory_value, category
+        )
 
         # 低置信度的「猜测」不许顶掉高置信度的既有偏好：
-        # 自动提炼偶尔给出 confidence=0.1 的条目，直接覆盖会让用户
+        # 写侧偶尔给出 confidence=0.1 的条目，直接覆盖会让用户
         # 明确说过的偏好在下一轮悄悄消失（见 PREF_CONFIDENCE_DROP_LIMIT 注释）。
         existing = self._find_active(user_id, memory_key, scope)
         if existing is not None:
@@ -389,7 +373,11 @@ class PreferenceManager:
                     f"{memory_key} 现有 {old_confidence:.2f} > 新值 {confidence:.2f}，"
                     "保留原偏好。"
                 )
-                return existing.get("memory_id")
+                raise PreferenceSkipped(
+                    f"{memory_key} 已有更高置信度的取值"
+                    f"（现有 {old_confidence:.2f} > 本次 {confidence:.2f}），"
+                    "保留原偏好，本次未写入。"
+                )
 
         self._check_budget(user_id, memory_key, memory_value, scope)
 
@@ -547,14 +535,15 @@ class PreferenceManager:
 __all__ = [
     "PreferenceManager",
     "PreferenceBudgetError",
+    "PreferenceSkipped",
     "PREF_TOTAL_CHAR_LIMIT",
     "PREF_MAX_ITEMS",
     "PREF_CONFIDENCE_DROP_LIMIT",
     "CANONICAL_KEY_ALIASES",
     "canonicalize_preference",
+    "normalize_preference",
     "CATEGORY_BY_KEY",
     "VALID_CATEGORIES",
     "canonical_category",
     "default_category_for",
-    "known_values_for",
 ]

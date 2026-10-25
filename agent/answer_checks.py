@@ -317,11 +317,32 @@ class FreshnessCheck:
             return None
         if usable_steps(memory) > 0:
             return None
+        # 不能只看 memory：final_answer 是在**当前这一步写进 memory 之前**被
+        # final_answer_checks 拦下的，所以「一步到位」的任务（模型同一段代码里
+        # 写完 web_search → extract → final_answer）memory 里只有 system / task
+        # 两个 step，usable_steps 恒为 0。
+        #
+        # 真实现场（「广州今日天气」）：Step 1 一次跑通，答案里 29℃ / 湿度 52%
+        # 全部来自 web_search，却被判「本轮还没有任何一步成功执行」；模型信了
+        # 这句话，后面 5 步重新搜索、拿表头当关键词搜、把表头当 URL 传给
+        # extract，越走越远。答案本身没问题，是这条守卫把它判死的。
+        #
+        # 账本里已有成功回执就说明「手上的变量是存在的」，交由
+        # grounding_problem 逐项核对数字依据即可，这里不再重复拦。
+        if self._has_successful_output():
+            return None
         return (
             "本轮还没有任何一步成功执行（每一步都报错或没有输出），"
             "你手上的变量可能根本不存在。"
             "请先写出能跑通的一步并把结果 print 出来，再基于真实结果作答；"
             "实在做不到就说明失败原因，不要给出具体数值。"
+        )
+
+    def _has_successful_output(self) -> bool:
+        """账本里有没有「真正拿回内容」的调用（`Error:` 开头的回执不算）。"""
+        return any(
+            output and not str(output).lstrip().startswith("Error")
+            for output in self.ledger.outputs()
         )
 
     def __call__(self, final_answer: Any, memory: Any) -> bool:

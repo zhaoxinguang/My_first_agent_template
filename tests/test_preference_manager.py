@@ -5,9 +5,10 @@ import pytest
 from memory.preference_manager import (
     PreferenceBudgetError,
     PreferenceManager,
+    PreferenceSkipped,
     canonical_category,
     canonicalize_preference,
-    known_values_for,
+    normalize_preference,
 )
 from memory.store import MemoryStore
 from tests.helpers import FakeEmbeddingClient
@@ -238,11 +239,16 @@ def test_canonicalize_preference_collapses_detail_dimension():
         assert canonicalize_preference(key, "回答简短一点")[0] == "answer_length"
 
 
-def test_canonicalize_preference_uses_value_when_key_is_wrong():
-    """值本身说明了维度时以值判维度：题目里那些错位记录都能纠回来。"""
-    assert canonicalize_preference("answer_format", "可爱风格")[0] == "response_style"
-    assert canonicalize_preference("response_style", "简短")[0] == "answer_length"
-    # 值也一起归一，目录里不会一会儿「short」一会儿「简短」
+def test_canonicalize_preference_does_not_guess_key_from_value():
+    """只按 key 归一，**不再看值猜维度**。
+
+    早期版本会把 ``response_style：简短`` 改写成 ``answer_length：简短``——
+    等于替模型猜语义，猜错方向就悄悄改写了用户真的想设的东西。
+    现在错位的 key 原样保留，要纠就改库或用 forget 重写。
+    """
+    assert canonicalize_preference("response_style", "简短")[0] == "response_style"
+    assert canonicalize_preference("answer_format", "可爱风格")[0] == "answer_format"
+    # 值归一仍然生效，只是不再反过来改 key
     assert canonicalize_preference("verbosity", "short") == ("answer_length", "简短")
 
 
@@ -260,10 +266,13 @@ def test_canonical_category_keeps_explicit_tooling():
     assert canonical_category("", "python_cmd") == "other"
 
 
-def test_known_values_for_lists_dimension_vocabulary():
-    assert "简短" in known_values_for("answer_length")
-    assert "informal" not in known_values_for("answer_format")
-    assert known_values_for("python_cmd") == set()
+def test_normalize_preference_bundles_key_value_category():
+    """归一化是纯函数：不碰数据库，工具层/排障脚本都能单独预演。"""
+    assert normalize_preference("detail_level", "short", "detail_level") == (
+        "answer_length",
+        "简短",
+        "response_style",
+    )
 
 
 def test_upsert_refuses_low_confidence_downgrade(store):
@@ -275,9 +284,9 @@ def test_upsert_refuses_low_confidence_downgrade(store):
     manager = PreferenceManager(store=store, embedding_client=None)
     kept_id = manager.upsert("u", "language", "中文", confidence=0.8)
 
-    new_id = manager.upsert("u", "language", "english", confidence=0.1)
+    with pytest.raises(PreferenceSkipped):
+        manager.upsert("u", "language", "english", confidence=0.1)
 
-    assert new_id == kept_id
     assert [p["memory_value"] for p in manager.list_preferences("u")] == ["中文"]
 
 
@@ -289,3 +298,21 @@ def test_upsert_allows_newer_high_confidence_value(store):
     manager.upsert("u", "language", "英文", confidence=0.9)
 
     assert [p["memory_value"] for p in manager.list_preferences("u")] == ["英文"]
+
+
+def test_upsert_canonicalizes_key_before_dedup(store):
+    """写侧归一化下沉到 upsert：同义 key 只占一行，覆盖而不是并列。
+
+    自动提炼移除后，写侧只剩 upsert 一个入口；不在这里归一，
+    ``detail_level`` 和 ``answer_length`` 会各存一行、互不覆盖，
+    目录里看着两条、模型能用的只有一个维度。
+    """
+    manager = PreferenceManager(store=store, embedding_client=None)
+    manager.upsert("u", "answer_length", "简短")
+
+    manager.upsert("u", "detail_level", "详细")
+
+    rows = manager.list_preferences("u")
+    assert len(rows) == 1
+    assert rows[0]["memory_key"] == "answer_length"
+    assert rows[0]["memory_value"] == "详细"

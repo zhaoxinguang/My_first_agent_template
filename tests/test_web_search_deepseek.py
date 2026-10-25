@@ -100,7 +100,12 @@ def test_results_are_formatted_for_the_model(monkeypatch):
     assert "https://example.com/a" in out
     assert "长摘要内容" in out  # 优先用 summary，缺了才用 snippet
     assert "Example News" in out
-    assert "score 2.4" in out
+    # rerank_score 刻意不渲染：三条结果常常同分，它只会漏进答案
+    assert "score" not in out
+    # 工具回执只说事实，不再夹带行为指令（那些在 prompts.yaml 的 web 规则里）
+    assert out.startswith("搜索结果 1 条：")
+    assert "先读摘要" not in out
+    assert "不要" not in out
 
 
 @pytest.mark.parametrize(

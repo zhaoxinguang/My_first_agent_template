@@ -4,10 +4,12 @@
 避免同一个偏好/同一段历史被多处注入（重复注入会浪费 token，
 也会让模型误判记忆的权重）。
 
-两类记忆各占一个块，块内自带约束语：
+两类记忆各占一个块：
 - 历史对话块：按语义相关性召回的「当时的问题 + 当时的回答」，
-  条数与字符预算由 memory/retriever.py 的常量硬约束；
-- 偏好块：用户的长期偏好，语气是「参考」，不是「硬指令」。
+  条数与字符预算由 memory/retriever.py 的常量硬约束，块首带约束语；
+- 偏好块：用户的长期偏好，只有一列 `- key：value`，不带说明文字
+  （怎么按需取全文写在 prompts.yaml 的固定规则里）。
+
 """
 
 from memory.retriever import (
@@ -23,29 +25,17 @@ from memory.retriever import (
 DEFAULT_USER_ID = "default_user"
 
 # 注入时给模型的约束说明。偏好是「参考」，不是「硬指令」。
+# 刻意压成一行：偏好块本身只是一列 `- key：value`，每轮固定进 prompt 的文字
+# 越少越好（本地 ollama 的 num_ctx 默认只有 4096）。怎么按需取全文、什么时候
+# 该写偏好，都放在 config/prompts.yaml 的固定规则里，不在这里重复一遍。
 PREFERENCE_INSTRUCTION = (
-    "请在不违背当前任务要求的前提下参考用户偏好。"
-    "偏好仅用于个性化，不得覆盖用户当前的明确指令；"
-    "若偏好与当前指令冲突，以当前指令为准，并简要说明你做了调整。"
+    "以上偏好仅供参考；与当前指令冲突时，以当前指令为准。"
 )
 
-# 按需加载的说明。目录只有要点，完整取值要靠工具，否则模型会对着
-# 「回答简洁，优先提供分步骤…」这半句话去猜用户到底要什么。
-# 措辞顺序（针对本地小模型）：先说「这是目录、够用就照做」，
-# 再说「不够用怎么取」，最后才是「什么时候才该自己写」——
-# 正例在前、例外在后，小模型才读得对。
-# 长度上刻意压到 150 字符以内：这段每轮都进 prompt，而本地 ollama 的
-# num_ctx 默认只有 4096，注入块的每一百字都在挤占生成空间。
-PREFERENCE_LOAD_HINT = (
-    "以上是用户偏好的目录，只有要点。"
-    "要点够用就直接照做；"
-    "某条可能影响当前任务、但要点不足以判断具体要求时，"
-    "先调用 load_user_preferences(key) 取全文，"
-    "或 load_user_preferences(query) 按语义查找，"
-    "不要凭截断的要点猜测。"
-    "偏好由系统每轮自动提炼，你不必主动保存；"
-    "只有用户明确要求「记住/忘掉某条」时，"
-    "才用 save_user_preference / forget_user_preference。"
+# 目录被条数上限截断时补的一行。仍然用列表形态，和上面几行读起来一致；
+# 不补这一行，模型会以为目录就是全部。
+PREFERENCE_HIDDEN_NOTE = (
+    '- （另有 {hidden} 条偏好，需要时用 load_user_preferences("") 查看）'
 )
 
 # 历史对话的约束说明。
@@ -76,9 +66,9 @@ def _build_preference_block(
 ) -> str:
     """注入「偏好目录」；完整内容由工具按需加载。
 
-    相比「按相关性把完整偏好塞进 prompt」，这里只放 key + 要点：
-    - 每轮固定开销可控（目录有字符上限），不会随偏好条数线性膨胀；
-    - 完整取值由 ``load_user_preferences`` 按需取，模型不用猜截断的要点。
+    返回的就是一列 ``- key：value``，不带任何说明文字：目录每轮都进 prompt，
+    本地 ollama 的 num_ctx 只有 4096，说明文字直接等于秒数。按需取全文的
+    用法写在 config/prompts.yaml 的固定规则里（规则 14/15），不在这里重复。
 
     两处用 getattr 做兼容：只实现 ``retrieve_preferences`` /
     ``format_preferences`` 的替身对象（测试、外部注入）仍能工作，
@@ -121,19 +111,14 @@ def _build_preference_block(
         return ""
 
     total = _count_preferences(retriever, user_id, scope)
-    hint = PREFERENCE_LOAD_HINT
     hidden = total - len(memories)
     if hidden > 0:
         # 目录有上限（PREF_INDEX_MAX_ITEMS / PREF_INDEX_MAX_CHARS），
         # 偏好却可以攒到 PREF_MAX_ITEMS 条。不说明「还有几条没列出来」，
         # 模型会以为目录就是全部，用户也看不出记忆只生效了一小部分。
-        hint = (
-            f"（上面只列了 {len(memories)}/{total} 条，"
-            f"其余 {hidden} 条需要时调用 load_user_preferences(\"\") 查看全部）"
-            f"\n{hint}"
-        )
+        return f"{block}\n{PREFERENCE_HIDDEN_NOTE.format(hidden=hidden)}"
 
-    return f"{block}\n\n{hint}"
+    return block
 
 
 def _count_preferences(retriever, user_id, scope) -> int:
@@ -283,7 +268,7 @@ def build_augmented_task(
 __all__ = [
     "DEFAULT_USER_ID",
     "PREFERENCE_INSTRUCTION",
-    "PREFERENCE_LOAD_HINT",
+    "PREFERENCE_HIDDEN_NOTE",
     "HISTORY_INSTRUCTION",
     "build_context",
     "build_history_context",

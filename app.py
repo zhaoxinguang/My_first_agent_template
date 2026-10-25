@@ -9,7 +9,6 @@
 """
 
 from agent.factory import create_agent
-from agent.model import create_model
 from Gradio_UI import GradioUI
 from config.settings import ACTIVE_MODEL, MODEL_PROFILES
 from memory import (
@@ -20,7 +19,6 @@ from memory import (
     MemoryRetriever,
     MemoryStore,
     PreferenceManager,
-    TurnDistiller,
 )
 
 
@@ -163,27 +161,22 @@ def log_preference_budget(preference_manager, retriever=None):
     if not status["ok"]:
         print(
             "[memory] 偏好已超出预算：新偏好会被拒绝写入，"
-            "请用 forget_user_preference 清理或用 set_preference.py 合并条目"
+            "请让 agent 调用 forget_user_preference 清理，"
+            "或合并相近条目（同维度多写几条只会互相顶掉）"
         )
 
 
-def log_distiller(distiller):
-    """启动时说明「每轮自动提炼」是否开启。
+def log_preference_write_policy():
+    """启动时说明偏好的写入责任在谁身上。
 
-    这件事直接影响两件事：用户偏好会不会自己长出来、
-    每轮会不会多一次模型调用（本地 ollama 下能感知到）。
-    与其让人猜，不如启动时打清楚。
+    每轮自动提炼已经取消：偏好只在模型判断「这条值得记」时由它自己调用
+    ``save_user_preference`` 写入。这是有意的取舍（可控优先于自动），
+    但代价是偏好增长依赖模型自觉，所以启动时把它讲清楚，避免
+    「聊了很多轮却一条偏好都没有」被当成 bug 排查。
     """
-    if not distiller.enabled:
-        print(
-            "[memory] 自动提炼：已关闭（PREF_AUTO_EXTRACT=0）。"
-            "偏好只能靠模型主动调 save_user_preference 写入"
-        )
-        return
-
     print(
-        "[memory] 自动提炼：开启（每轮结束后台提炼 0~"
-        f"{distiller.max_preferences} 条偏好 + 本轮摘要）"
+        "[memory] 偏好写入：无自动提炼，由模型在任务收尾时自行判断并调用 "
+        "save_user_preference（用户明说「记住」时同样走这个工具）"
     )
 
 
@@ -200,22 +193,15 @@ def main():
         embedding_client=embedding_client,
     )
 
-    # 1.1 偏好写侧：动态更新的入口（agent 工具与 set_preference.py 共用）
+    # 1.1 偏好写侧：动态更新的唯一入口（agent 的 save/forget 工具走的就是它）
     preference_manager = PreferenceManager(
         store=store,
         embedding_client=embedding_client,
     )
     log_preference_budget(preference_manager, retriever)
+    log_preference_write_policy()
 
-    # 1.2 每轮结束的自动提炼：偏好 + 本轮摘要，运行时保证，不靠模型自觉
-    distiller = TurnDistiller(
-        store=store,
-        embedding_client=embedding_client,
-        model_factory=create_model,
-    )
-    log_distiller(distiller)
-
-    # 1.3 历史对话索引：同一套 embedding（默认 ollama 本地模型），
+    # 1.2 历史对话索引：同一套 embedding（默认 ollama 本地模型），
     #     启动时补齐缺失向量，之后每轮结束由 GradioUI 增量写入。
     history_index = HistoryIndex(
         store=store,
@@ -241,7 +227,6 @@ def main():
         memory_store=store,
         user_id=DEFAULT_USER_ID,
         history_index=history_index,
-        distiller=distiller,
     ).launch()
 
 

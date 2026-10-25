@@ -153,11 +153,14 @@ class MemoryStore:
                 )
             """)
 
-            # 每轮对话的「提炼记忆」：由 memory/distiller.py 在每轮结束后写入。
+            # 每轮对话的「提炼记忆」：摘要 + 可复用事实，供历史召回优先使用。
             # 与 agent_runs 的分工：
             # - agent_runs 存原始问答（原文，可能几千字）；
             # - turn_memories 存提炼后的摘要与事实（短，可直接进 prompt）。
             # run_id 主键保证「同一轮只能提炼一次」，天然幂等。
+            # 现状：写入方只剩手工/排障脚本（每轮自动提炼已取消，偏好改由
+            # 模型在任务收尾时自行调用 save_user_preference）；存量行仍会被
+            # MemoryRetriever.format_history 优先使用。
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS turn_memories (
                     run_id INTEGER PRIMARY KEY,

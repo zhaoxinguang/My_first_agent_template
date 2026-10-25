@@ -219,7 +219,6 @@ class GradioUI:
         memory_store: MemoryStore | None = None,
         user_id: str = DEFAULT_USER_ID,
         history_index: HistoryIndex | None = None,
-        distiller=None,
     ):
         if not _is_package_available("gradio"):
             raise ModuleNotFoundError(
@@ -238,9 +237,6 @@ class GradioUI:
         # 历史对话的向量索引：给了就在每轮结束后补一条向量，
         # 这样后续对话的语义召回才有数据可查（没给就只存文本，不建向量）。
         self.history_index = history_index
-        # 每轮结束后的自动提炼（偏好 + 本轮摘要）。这是运行时保证，
-        # 不依赖模型自己想起来调 save_user_preference。
-        self.distiller = distiller
 
     def interact_with_agent(self, prompt, messages):
         import gradio as gr
@@ -268,15 +264,6 @@ class GradioUI:
             # 不会丢掉「用户问了什么、模型答了什么」这条记录。
             if self.history_index is not None:
                 self.history_index.index_run(
-                    run_id=run_id,
-                    task=prompt,
-                    final_answer=answer,
-                )
-
-            # 自动提炼偏好 + 本轮摘要。放后台线程：答案已经给用户了，
-            # 提炼再慢也不该拖住这一轮；内部已兜住所有异常。
-            if self.distiller is not None:
-                self.distiller.distill_async(
                     run_id=run_id,
                     task=prompt,
                     final_answer=answer,

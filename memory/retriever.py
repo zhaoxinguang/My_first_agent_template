@@ -2,7 +2,7 @@
 import json
 import math
 
-from memory.embedding import EmbeddingClient
+from memory.embedding import EmbeddingClient  # noqa: F401  (对外类型标注/兼容导出)
 from memory.preference_manager import (
     CANONICAL_KEY_ALIASES,
     VALID_CATEGORIES,
@@ -126,6 +126,11 @@ def _catalog_rows(items, min_confidence=PREF_INDEX_MIN_CONFIDENCE):
 
     归并规则：同一规范 key 只保留 ``(置信度, updated_at)`` 最大的一条；
     顺序保持入参顺序（调用方已按「最近写入优先」排好），输出稳定。
+
+    这里只做**归并**，不做语义纠错：早期版本还会拦「英文单词 + 该维度不认」
+    的值（``answer_format：informal``），但那是替小模型猜语义、且有误伤
+    （用户真说过 english），已删除。库里的怪值会原样出现在目录里，
+    需要清理就用 ``forget`` 或直接改库。
     """
     best = {}
     order = []
@@ -452,7 +457,7 @@ class MemoryRetriever:
         # 为什么不能以 use_count 为首键（曾经就是这么写的，结果是学习闭环断掉）：
         # ``MemoryStore.save_preference`` 覆盖同 key 时是「旧版本转 inactive +
         # 插入新行」，新行的 use_count 归 0，于是
-        #   - 刚自动提炼出来的偏好（use_count=0）永远排在最后，
+        #   - 刚写入的偏好（use_count=0）永远排在最后，
         #     条数一超过目录上限就再也进不了 prompt；
         #   - 刚被改过值的偏好同样掉到最后，比没改的还靠后。
         # 也就是说：越新的记忆越看不见，和「动态更新」正好相反。

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import difflib
+import re
 from typing import Any, Iterable
 
 from agent.answer_checks import attach_answer_checks
@@ -28,7 +30,67 @@ from config.settings import (
 # 模型才不会把半句话当成完整结论，也不会以为自己看错了。
 FOLDED_MARKER = " …（该步输出已折叠，共省略 {omitted} 字）"
 
-_TOOL_RESPONSE_ROLES = ("tool-response", "tool_response", "tool")
+_TOOL_RESPONSE_ROLES = ("tool-response", "tool_response", "tool", "observation")
+
+# smolagents 沙箱里调用了未注册函数时的报错。原文一长串英文，且不给任何出路：
+#   InterpreterError: Forbidden function evaluation: 'load_user_preference' is not
+#   among the explicitly allowed tools or defined/imported in the preceding code
+# 真实现场：llama3.2 把 load_user_preferences 写成单数，撞上这句后彻底放弃了
+# 这个工具，改成 result.split("\n") 直接吐原始搜索结果。
+_TOOL_NAME_ERROR_RE = re.compile(
+    r"Forbidden function evaluation: "
+    r"'(?P<name>[A-Za-z_]\w*)' is not among the explicitly allowed tools[^\n]*"
+)
+
+
+def _tool_name_hint(bad: str, tool_names: Iterable[str]) -> str:
+    """把「没有这个函数」的报错改写成「你大概想用 X，改完重跑」。"""
+    names = [str(name) for name in tool_names]
+    close = difflib.get_close_matches(bad, names, n=1, cutoff=0.6)
+    if close:
+        return (
+            f"没有名为 {bad} 的工具，最接近的是 {close[0]}。"
+            f"把这一行的函数名改成 {close[0]}（参数不用动）后重新执行这一步；"
+            f"不要因为这行报错就跳过这个工具，也不要改用字符串切分之类的替代做法。"
+        )
+    available = ", ".join(sorted(names)) or "（无）"
+    return (
+        f"没有名为 {bad} 的工具。可用工具：{available}。"
+        f"改用其中一个后重新执行这一步。"
+    )
+
+
+def repair_tool_name_errors(messages: Iterable[Any], tool_names: Iterable[str]) -> list[Any]:
+    """把 Observation 里的「函数不存在」报错换成带修正建议的版本。
+
+    只改「发给模型的副本」，不动 ``agent.memory.steps``，原始记录保持可审计。
+    必须在 ``ObservationTrimmer`` 之前跑：折叠只看长度，可能把这句截断。
+    """
+    names = [str(name) for name in tool_names]
+    messages = list(messages)
+    if not names:
+        return messages
+
+    for index, message in enumerate(messages):
+        if _role_of(message) not in _TOOL_RESPONSE_ROLES:
+            continue
+        parts = _text_parts(message)
+        if not parts:
+            continue
+
+        new_parts = []
+        changed = False
+        for part in parts:
+            text = str(part.get("text") or "")
+            fixed = _TOOL_NAME_ERROR_RE.sub(lambda m: _tool_name_hint(m.group("name"), names), text)
+            if fixed != text:
+                changed = True
+                new_parts.append({**part, "text": fixed})
+            else:
+                new_parts.append(part)
+        if changed:
+            messages[index] = {**message, "content": new_parts}
+    return messages
 
 
 def _role_of(message: Any) -> str:
@@ -151,8 +213,17 @@ def attach_guards(agent: Any, ledger: Any = None) -> dict:
     #    包这里既不丢原始记录，也能覆盖 step() 和 provide_final_answer() 两条路径。
     original_write = agent.write_memory_to_messages
 
+    def _tool_names() -> list[str]:
+        # 每次现取：tools 上可能被追加工具（final_answer 就是被替换过的那个）。
+        names = list(getattr(agent, "tools", {}) or {})
+        names.extend(getattr(agent, "managed_agents", {}) or {})
+        return names
+
     def write_memory_to_messages(*args, **kwargs):
-        return trimmer(original_write(*args, **kwargs))
+        messages = original_write(*args, **kwargs)
+        # 先纠错再折叠：折叠按字数截，可能把「函数不存在」那句截掉半截。
+        messages = repair_tool_name_errors(messages, _tool_names())
+        return trimmer(messages)
 
     agent.write_memory_to_messages = write_memory_to_messages
 
@@ -174,5 +245,6 @@ __all__ = [
     "FOLDED_MARKER",
     "ObservationTrimmer",
     "attach_guards",
+    "repair_tool_name_errors",
     "reset_tool_state",
 ]

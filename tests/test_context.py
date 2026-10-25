@@ -3,8 +3,8 @@
 from memory.context import (
     DEFAULT_USER_ID,
     HISTORY_INSTRUCTION,
+    PREFERENCE_HIDDEN_NOTE,
     PREFERENCE_INSTRUCTION,
-    PREFERENCE_LOAD_HINT,
     augment_task,
     build_augmented_task,
     build_context,
@@ -128,6 +128,7 @@ def test_catalog_reports_how_many_preferences_are_hidden(store):
     """目录被条数上限截断时，必须告诉模型「还有 N 条」。
 
     否则模型以为目录就是全部，用户也看不出记忆只生效了一部分。
+    说明只占一行，且仍然是列表形态（不再有整段提示语）。
     """
     for i in range(5):
         store.save_preference("u", "cat", f"k{i}", f"值{i}")
@@ -135,7 +136,7 @@ def test_catalog_reports_how_many_preferences_are_hidden(store):
 
     result = build_augmented_task("写个快排", retriever, user_id="u", limit=2)
 
-    assert "只列了 2/5 条" in result
+    assert PREFERENCE_HIDDEN_NOTE.format(hidden=3) in result
     assert 'load_user_preferences("")' in result
 
 
@@ -146,7 +147,7 @@ def test_catalog_without_truncation_has_no_count_note(store):
 
     result = build_augmented_task("写个快排", retriever, user_id="u")
 
-    assert "只列了" not in result
+    assert "另有" not in result
 
 
 def test_catalog_note_is_skipped_when_retriever_cannot_count():
@@ -155,7 +156,7 @@ def test_catalog_note_is_skipped_when_retriever_cannot_count():
 
     result = build_augmented_task("任务", retriever)
 
-    assert "只列了" not in result
+    assert "另有" not in result
 
 
 # ---------- 历史对话块 ----------
@@ -230,8 +231,30 @@ def test_preference_block_is_catalog_not_full_text(store):
     assert "answer_style" in result
     assert long_value not in result          # 全文没有进 prompt
     assert "…" in result                     # 要点被截断
-    assert PREFERENCE_LOAD_HINT in result    # 但告诉了模型怎么按需取
-    assert "load_user_preferences" in result
+
+
+def test_preference_block_is_plain_list_without_prose(store):
+    """偏好块就是一列 `- key：value`：不再塞任何说明文字。
+
+    每轮都进 prompt 的固定开销要小到只剩内容本身；「怎么按需取全文」
+    「什么时候该写偏好」这类说明放在 prompts.yaml 的固定规则里。
+    """
+    store.save_preference("u", "response_style", "answer_format", "分条")
+    store.save_preference("u", "response_style", "answer_length", "简短")
+    retriever = MemoryRetriever(store=store, embedding_client=None)
+
+    block = build_augmented_task("写个快排", retriever, user_id="u")
+    block = block.split(PREFERENCE_INSTRUCTION)[0].strip()
+
+    lines = block.splitlines()
+    # 内容对，且顺序不依赖写入先后（目录按 updated_at 排序，同秒写入会并列）
+    assert set(lines) == {"- answer_format：分条", "- answer_length：简短"}
+    # 每一行都是 `- key：value`：没有标题、没有说明句
+    assert all(line.startswith("- ") for line in lines)
+    # 不再出现「目录 / 要点 / load_user_preferences」这类说明文字
+    assert "目录" not in block
+    assert "要点" not in block
+    assert "load_user_preferences" not in block
 
 
 def test_short_preference_value_stays_visible(store):
@@ -261,9 +284,9 @@ def test_preference_catalog_stays_within_budget(store):
     retriever = MemoryRetriever(store=store, embedding_client=None)
 
     result = build_augmented_task("写个快排", retriever, user_id="u")
-    catalog = result.split(PREFERENCE_LOAD_HINT)[0]
+    catalog = result.split(PREFERENCE_INSTRUCTION)[0]
 
-    assert len(catalog) <= 620 + 80  # 目录块预算（含换行）
+    assert len(catalog) <= 620 + 80  # 目录块预算（含换行与截断说明）
 
 
 def test_catalog_reads_live_database_each_turn(store):

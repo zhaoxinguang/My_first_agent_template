@@ -186,6 +186,22 @@ def test_create_agent_assembles_code_agent():
     assert agent.max_steps == MAX_STEPS
 
 
+def test_create_agent_installs_lenient_final_answer():
+    """装配出来的 final_answer 必须容忍模型多传的偏好参数。
+
+    真实现场：final_answer(result, answer_format="分条") 抛 TypeError，
+    整步白跑；前面已经拿到的搜索结果一步都没交出去。
+    """
+    pytest.importorskip("smolagents")
+    from agent.factory import create_agent
+    from agent.final_answer_tool import FinalAnswerRewritingExecutor, LenientFinalAnswerTool
+
+    agent = create_agent(include_web=False)
+
+    assert isinstance(agent.tools["final_answer"], LenientFinalAnswerTool)
+    assert isinstance(agent.python_executor, FinalAnswerRewritingExecutor)
+
+
 def test_create_agent_loads_custom_prompt():
     pytest.importorskip("smolagents")
     from agent.factory import create_agent

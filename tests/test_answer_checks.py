@@ -7,7 +7,7 @@
 
 import pytest
 from smolagents import Tool
-from smolagents.memory import ActionStep, TaskStep
+from smolagents.memory import ActionStep, SystemPromptStep, TaskStep
 from smolagents.models import ChatMessage, MessageRole, Model
 
 from agent.answer_checks import (
@@ -545,3 +545,58 @@ def test_ungrounded_numbers_fullwidth_and_spacing():
 
     # 全角数字与多空格都要能对上
     assert ungrounded_numbers("气温３４度", ["气温 34 度"]) == []
+
+
+# ---------- 一步到位：current step 尚未入 memory ----------
+
+class _OnlyPromptMemory:
+    """模型在同一段代码里跑完工具并 final_answer 时的真实 memory 形状。
+
+    ``final_answer`` 是在当前 ActionStep 收尾**之前**被 final_answer_checks
+    拦下的，所以此刻 memory.steps 里只有 system prompt 和 task 两个 step。
+    """
+
+    def __init__(self, task):
+        self.steps = [SystemPromptStep(system_prompt="…"), TaskStep(task=task)]
+
+
+def test_single_step_done_in_one_go_is_not_blocked():
+    """回归：一步到位拿到的真实数据，不能被「一步都没跑通」判死。
+
+    真实现场（「广州今日天气」）：Step 1 里 web_search + extract + final_answer
+    一次写完，答案里 29℃ / 湿度 52% 全部来自搜索结果，却被拦成
+    「本轮还没有任何一步成功执行」，模型信了这句话，后面 5 步重新搜索、
+    拿表头当关键词搜、把表头当 URL 传给 extract，越走越远。
+    """
+    ledger = ToolCallLedger()
+    ledger.record(
+        "web_search",
+        ("广州今日天气",),
+        {},
+        output=(
+            "摘要：29 晴 今天13:34更新 湿度 52% 北风4级 今日天气提示 略微偏热\n"
+            "摘要：32 晴 今天14:45更新 湿度 41% 东北风2级 今日天气提示 感觉燥热"
+        ),
+    )
+    check = FreshnessCheck(ledger)
+
+    answer = "广州今天晴，29℃，湿度 52%，北风 4 级。"
+
+    assert check(answer, _OnlyPromptMemory("查询广州今日的天气")) is True
+
+
+def test_single_step_still_blocked_when_every_tool_call_failed():
+    """工具全都只回了 Error：账本再长也不算「跑通了」。
+
+    用非时效任务，避开「没查证」「数字没依据」那两条更早的守卫，
+    单独验证 failed_steps_problem 本身。
+    """
+    ledger = ToolCallLedger()
+    ledger.record("web_search", ("广州天气",), {}, output="Error: rate limited (429)")
+    ledger.record("extract", ("https://e.com", "气温"), {}, output="Error: 抓取超时")
+    check = FreshnessCheck(ledger)
+
+    with pytest.raises(AssertionError) as exc:
+        check("账单总额是 1234 元", _OnlyPromptMemory("读一下 documents 里的账单，算总额"))
+
+    assert "没有任何一步成功" in str(exc.value)
